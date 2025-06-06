@@ -297,18 +297,18 @@ class RealtimeWhisperServer:
         """Synchronous transcription function."""
         self._log_thread_usage("start", f"({client_id})")
         try:
-            inputs = self.processor(audio_segment, sampling_rate=self.sample_rate, return_tensors="pt")
+            inputs = self.processor(audio_segment, sampling_rate=self.sample_rate, return_tensors="pt") # type: ignore
             input_features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
             
             with torch.inference_mode():
-                output_ids = self.whisper_model.generate(
+                output_ids = self.whisper_model.generate( # type: ignore
                     input_features,
                     max_new_tokens=200,
                     num_beams=1,
                     do_sample=False
                 )
             
-            text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip() # type: ignore
             return text
         except Exception as e:
             self.logger.error(f"Transcription error: {e}")
@@ -464,7 +464,7 @@ def on_speech_transcribed(text: str, client_id: str, duration: float):
 # Example standalone usage
 async def main():
     server = RealtimeWhisperServer(
-        model_path="/home/logus2k/env/jarbas/data/models/whisper-large-v3-turbo",
+        model_path="/stt_server/data/models/whisper-large-v3-turbo",
         port=2700,
         on_transcription=on_speech_transcribed,  # Your callback function
         silence_duration=0.8,
