@@ -1,0 +1,12 @@
+{
+  "model_path": "/home/logus2k/env/stt_server/data/models/whisper-large-v3-turbo",
+  "port": 2700,
+  "host": "0.0.0.0",
+  "silence_duration": 0.8,
+  "min_speech_duration": 0.4,
+  "vad_threshold": 0.4,
+  "processing_interval": 0.3,
+  "max_workers": 2,
+  "sample_rate": 16000,
+  "enable_logging": true
+}

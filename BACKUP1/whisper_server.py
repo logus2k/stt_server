@@ -418,7 +418,7 @@ class RealtimeWhisperServer:
             self.app,
             host=self.host,
             port=self.port,
-            log_level="warning"  # ✅ Set to warning to reduce uvicorn noise
+            log_level="warning"  # Set to warning to reduce uvicorn noise
         )
         self.server = uvicorn.Server(config)
         
@@ -455,8 +455,7 @@ def on_speech_transcribed(text: str, client_id: str, duration: float):
     """
     print(f"📞 CALLBACK: Client {client_id} said: '{text}' ({duration:.1f}s)")
     
-    # Here you would:
-    # 1. Send the text to your LLM
+    # 1. Send the text to the LLM
     # 2. Get the LLM response
     # 3. Convert LLM response to speech (TTS)
     # 4. Send audio back to client or play locally
@@ -466,7 +465,7 @@ async def main():
     server = RealtimeWhisperServer(
         model_path="/stt_server/data/models/whisper-large-v3-turbo",
         port=2700,
-        on_transcription=on_speech_transcribed,  # Your callback function
+        on_transcription=on_speech_transcribed,  # Callback function
         silence_duration=0.8,
         enable_logging=True
     )
