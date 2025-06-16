@@ -489,9 +489,15 @@ async def main():
     )
     """
 
-    server = STTServer.from_config(str(Path.cwd()) + "/data/configuration/stt.server.settings.json")    
-    
-    await server.run_forever()
+    try:
+        server = STTServer.from_config(str(Path.cwd()) + "/data/configuration/stt.server.settings.json")
+        # Assign the callback function
+        server.on_transcription = on_speech_transcribed 
+        await server.run_forever()
 
+    except:
+        print("Error loading configuration from " + str(Path.cwd()) + "/data/configuration/stt.server.settings.json")
+    
+    
 if __name__ == "__main__":
     asyncio.run(main())

@@ -8,4 +8,4 @@ EXPOSE 2700
 
 WORKDIR /stt_server
 
-CMD ["python", "stt_server.py"]
+CMD ["python", "-u", "stt_server.py"]

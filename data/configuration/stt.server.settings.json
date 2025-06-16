@@ -1,5 +1,5 @@
 {
-  "model_path": "/home/logus2k/env/stt_server/data/models/whisper-large-v3-turbo",
+  "model_path": "/stt_server/data/models/whisper-large-v3-turbo",
   "port": 2700,
   "host": "0.0.0.0",
   "silence_duration": 0.8,

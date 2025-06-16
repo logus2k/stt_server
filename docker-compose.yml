@@ -23,7 +23,7 @@ services:
     ports:
       - "2700:2700"
     volumes:
-      - ~/env/logos/data:/stt_server/data:ro
+      - ~/env/stt_server/data:/stt_server/data:ro
 
 networks:
   pm:
