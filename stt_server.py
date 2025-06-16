@@ -1,4 +1,4 @@
-# whisper_server.py
+# stt_server.py
 
 """
 pip install --upgrade pip 
