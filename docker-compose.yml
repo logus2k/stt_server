@@ -20,15 +20,11 @@ services:
         max-file: "3"    
     networks:
       logus2k:
-        ipv4_address: 172.20.0.10
     ports:
       - "2700:2700"
     volumes:
       - ~/env/stt_server/data:/stt_server/data:ro
 
 networks:
-  logus2k:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
+  logus2k_network:
+    external: true
