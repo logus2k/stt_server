@@ -19,13 +19,16 @@ services:
         max-size: "10m"
         max-file: "3"    
     networks:
-      - pm
+      logus2k:
+        ipv4_address: 172.20.0.10
     ports:
       - "2700:2700"
     volumes:
       - ~/env/stt_server/data:/stt_server/data:ro
 
 networks:
-  pm:
-    name: pm-network
-    external: true
+  logus2k:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
