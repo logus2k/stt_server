@@ -19,7 +19,7 @@ services:
         max-size: "10m"
         max-file: "3"    
     networks:
-      logus2k:
+      logus2k_network:
     ports:
       - "2700:2700"
     volumes:
