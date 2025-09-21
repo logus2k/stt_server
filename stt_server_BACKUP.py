@@ -217,7 +217,6 @@ class STTServer:
             # if self.enable_logging:
             #     print(f"✅ Cleanup completed for client: {client_id}, removed {len(cleaned_sessions)} sessions")
 
-
         @self.sio.event
         async def audio_data(sid, data):
             """Handle incoming audio data."""
@@ -230,75 +229,52 @@ class STTServer:
                     # Legacy format (raw audio data)
                     audio_data = data
                     client_id = f"client-{sid[:8]}"
-
-                # Ensure the sender is in the client_id room (idempotent)
-                await self.sio.enter_room(sid, client_id)
-
-                # CREATE OR GET TRANSCRIBER USING THE CLIENT_ID (not sid)
+                
+                # ✅ CREATE OR GET TRANSCRIBER USING THE CLIENT_ID (not sid)
                 if client_id not in self.client_transcribers:
+                    # ✅ ESSENTIAL: New session creation
                     if self.enable_logging:
                         print(f"🆕 Session CREATED: {client_id}")
                     self.client_transcribers[client_id] = self._ClientTranscriber(self)
-
-                # Convert binary PCM16 -> float32 (-1..1)
+                
+                # Convert binary data to numpy array
                 if isinstance(audio_data, (bytes, bytearray)):
                     samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
                 else:
-                    return  # unsupported format (keep silent to avoid log spam)
-
+                    return
+                
                 transcriber = self.client_transcribers[client_id]
                 transcriber.add_audio(samples.tolist())
-
+                
                 # Check for ready segments
                 audio_segment = transcriber.get_ready_segment()
+                
                 if audio_segment is not None:
                     # Process segment
                     duration = len(audio_segment) / self.sample_rate
                     text = await self._transcribe_async(audio_segment, client_id)
-
+                    
                     if text and len(text.strip()) > 1:
+                        # ✅ ESSENTIAL: Transcription result
                         if self.enable_logging:
                             print(f"🗣️ [{duration:.1f}s] {client_id}: {text}")
-
-                        payload = {
-                            "text": text,
-                            "duration": duration,
-                            "client_id": client_id,
-                            "ts": time.time(),
-                        }
-
-                        # NEW: broadcast to everyone subscribed to this clientId (e.g., agent_server)
-                        await self.sio.emit("transcription", payload, room=client_id)
-
-                        # LEGACY: also emit to the audio sender socket (keeps old clients working)
-                        await self.sio.emit("transcription", payload, room=sid)
-
-                        # Optional user callback
+                        
+                        # Send transcription with the provided client ID
+                        await self.sio.emit('transcription', {
+                            'text': text,
+                            'duration': duration,
+                            'client_id': client_id  # Use the provided client ID
+                        }, room=sid)
+                        
+                        # Call user callback
                         if self.on_transcription:
                             try:
                                 self.on_transcription(text, client_id, duration)
                             except Exception as e:
                                 self.logger.error(f"Error in transcription callback: {e}")
-
+                
             except Exception as e:
                 self.logger.error(f"Error processing audio from {sid}: {e}")
-
-
-        @self.sio.event
-        async def subscribe_transcripts(sid, data):
-            """Allow a socket (e.g., agent_server) to subscribe to transcripts for a clientId."""
-            client_id = (data or {}).get("clientId")
-            # token = (data or {}).get("token")  # optional: verify if you add auth
-
-            if not client_id:
-                return await self.sio.emit("error", {"msg": "missing clientId"}, room=sid)
-
-            await self.sio.enter_room(sid, client_id)
-            if self.enable_logging:
-                print(f"👂 Subscribed {sid[:8]} to transcripts room: {client_id}")
-
-            await self.sio.emit("subscribed", {"clientId": client_id}, room=sid)
-
     
     async def initialize(self):
         """Load models and initialize components."""
