@@ -2,11 +2,11 @@
     "model_path": "/stt_server/data/models/whisper-large-v3-turbo",
     "port": 2700,
     "host": "0.0.0.0",
-    "silence_duration": 0.4,
+    "silence_duration": 0.8,
     "min_speech_duration": 0.3,
     "vad_threshold": 0.5,
     "processing_interval": 0.15,
-    "max_workers": 2,
+    "max_workers": 4,
     "sample_rate": 16000,
-    "enable_logging": true
+    "enable_logging": false
 }
