@@ -1,5 +1,4 @@
 services:
-
   stt_server:
     profiles:
       - default
@@ -8,12 +7,13 @@ services:
     image: stt_server:1.0
     container_name: stt_server
     hostname: stt_server
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=0
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
-      - CUDA_HOME=/usr/local/cuda    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: "all"
+              capabilities: [gpu]
     logging:
       options:
         max-size: "10m"
@@ -23,7 +23,7 @@ services:
     ports:
       - "2700:2700"
     volumes:
-      - ~/env/stt_server/data:/stt_server/data:ro
+      - ~/env/assets/stt_server/data:/stt_server/data:ro
 
 networks:
   logus2k_network:
