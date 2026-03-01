@@ -1,0 +1,369 @@
+<mxfile host="app.diagrams.net" agent="Claude Code" version="26.0.0">
+  <diagram id="stt-server-architecture" name="STT Server Architecture">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ============================================================ -->
+        <!-- TITLE                                                        -->
+        <!-- ============================================================ -->
+        <mxCell id="title" value="STT Server — Component Architecture" style="text;html=1;fontSize=20;fontStyle=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="450" y="20" width="500" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- EXTERNAL CLIENTS (left side)                                 -->
+        <!-- ============================================================ -->
+        <mxCell id="audio-client" value="&lt;b&gt;Audio Client&lt;/b&gt;&lt;br&gt;(Browser / App)" style="shape=mxgraph.basic.cloud_callout;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="220" width="170" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="monitor-client" value="&lt;b&gt;Monitoring Client&lt;/b&gt;&lt;br&gt;(LLM Assistant /&lt;br&gt;Agent Server)" style="shape=mxgraph.basic.cloud_callout;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="530" width="170" height="110" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- MAIN SERVER BOUNDARY                                         -->
+        <!-- ============================================================ -->
+        <mxCell id="server-boundary" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#666666;strokeWidth=2;dashed=1;dashPattern=8 4;arcSize=6;" vertex="1" parent="1">
+          <mxGeometry x="280" y="80" width="1050" height="640" as="geometry" />
+        </mxCell>
+        <mxCell id="server-label" value="STTServer  (stt_server.py)" style="text;html=1;fontSize=14;fontStyle=5;align=left;verticalAlign=top;whiteSpace=wrap;fontColor=#444444;" vertex="1" parent="1">
+          <mxGeometry x="295" y="88" width="300" height="24" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- NETWORK / TRANSPORT LAYER                                    -->
+        <!-- ============================================================ -->
+        <mxCell id="transport-group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="310" y="130" width="310" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="transport-label" value="Network / Transport Layer" style="text;html=1;fontSize=12;fontStyle=5;align=left;verticalAlign=top;whiteSpace=wrap;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="320" y="136" width="220" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="uvicorn" value="&lt;b&gt;Uvicorn&lt;/b&gt;&lt;br&gt;ASGI Server" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="350" y="170" width="140" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="socketio-server" value="&lt;b&gt;Socket.IO&lt;/b&gt;&lt;br&gt;AsyncServer&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;(python-socketio)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="350" y="250" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="asgi-app" value="&lt;b&gt;ASGIApp&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="510" y="200" width="90" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Socket.IO Event Handlers box -->
+        <mxCell id="event-handlers" value="&lt;b&gt;Event Handlers&lt;/b&gt;&lt;hr&gt;&lt;font style=&quot;font-size:10px&quot;&gt;connect&lt;br&gt;disconnect&lt;br&gt;audio_data&lt;br&gt;subscribe_transcripts&lt;br&gt;cleanup_client&lt;br&gt;client_disconnected&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="340" y="340" width="160" height="130" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- CLIENT SESSION MANAGEMENT                                    -->
+        <!-- ============================================================ -->
+        <mxCell id="session-group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="660" y="130" width="270" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="session-label" value="Client Session Management" style="text;html=1;fontSize=12;fontStyle=5;align=left;verticalAlign=top;whiteSpace=wrap;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="670" y="136" width="220" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="client-transcribers-map" value="&lt;b&gt;client_transcribers&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Dict[client_id, _ClientTranscriber]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="680" y="170" width="230" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="client-transcriber" value="&lt;b&gt;_ClientTranscriber&lt;/b&gt;&lt;hr&gt;&lt;font style=&quot;font-size:10px&quot;&gt;audio_buffer [ ]&lt;br&gt;last_processed_time&lt;br&gt;add_audio(samples)&lt;br&gt;get_ready_segment() → ndarray | None&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="695" y="240" width="200" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- ML INFERENCE LAYER                                           -->
+        <!-- ============================================================ -->
+        <mxCell id="ml-group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="660" y="390" width="650" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="ml-label" value="ML Inference Layer" style="text;html=1;fontSize=12;fontStyle=5;align=left;verticalAlign=top;whiteSpace=wrap;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="670" y="396" width="200" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="vad-model" value="&lt;b&gt;Silero VAD&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Voice Activity Detection&lt;br&gt;get_speech_timestamps()&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="690" y="430" width="190" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="thread-pool" value="&lt;b&gt;ThreadPoolExecutor&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;max_workers (async → sync bridge)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="920" y="430" width="200" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="whisper-model" value="&lt;b&gt;Whisper Large v3 Turbo&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;AutoModelForSpeechSeq2Seq&lt;br&gt;+ AutoProcessor&lt;br&gt;(torch.compile, CUDA/CPU)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="900" y="510" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- CONFIGURATION                                                -->
+        <!-- ============================================================ -->
+        <mxCell id="config-file" value="&lt;b&gt;stt.server.settings.json&lt;/b&gt;&lt;hr&gt;&lt;font style=&quot;font-size:10px&quot;&gt;model_path&lt;br&gt;host / port&lt;br&gt;silence_duration&lt;br&gt;min_speech_duration&lt;br&gt;vad_threshold&lt;br&gt;processing_interval&lt;br&gt;max_workers&lt;br&gt;sample_rate&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;size=15;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="120" width="170" height="180" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- CALLBACK / OUTPUT                                            -->
+        <!-- ============================================================ -->
+        <mxCell id="callback" value="&lt;b&gt;on_transcription&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Callback Hook&lt;br&gt;(text, client_id, duration)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="310" width="170" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- DOCKER LAYER (bottom)                                        -->
+        <!-- ============================================================ -->
+        <mxCell id="docker-group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#deecf9;strokeColor=#4a86c8;arcSize=6;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="310" y="760" width="660" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="docker-label" value="Docker Deployment" style="text;html=1;fontSize=12;fontStyle=5;align=left;verticalAlign=top;whiteSpace=wrap;fontColor=#4a86c8;" vertex="1" parent="1">
+          <mxGeometry x="320" y="768" width="200" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="docker-base" value="&lt;b&gt;stt_server-server:1.0&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Base Image&lt;br&gt;Python 3.10 + pip deps&lt;br&gt;(stt_server.server.Dockerfile)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#deecf9;strokeColor=#4a86c8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="795" width="230" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="docker-app" value="&lt;b&gt;stt_server:1.0&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;App Image&lt;br&gt;Copies stt_server.py, exposes :2700&lt;br&gt;(stt_server.Dockerfile)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#deecf9;strokeColor=#4a86c8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="620" y="795" width="230" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- SOCKET.IO ROOMS (legend-like)                                -->
+        <!-- ============================================================ -->
+        <mxCell id="rooms-box" value="&lt;b&gt;Socket.IO Rooms&lt;/b&gt;&lt;hr&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Each &lt;i&gt;clientId&lt;/i&gt; is a room.&lt;br&gt;Audio senders &amp;amp; subscribers&lt;br&gt;join the same room to receive&lt;br&gt;&lt;b&gt;transcription&lt;/b&gt; events.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6d0de;strokeColor=#996185;fontSize=11;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="340" y="500" width="190" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- EDGES / CONNECTIONS                                          -->
+        <!-- ============================================================ -->
+
+        <!-- Audio Client → Socket.IO (audio_data) -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#6c8ebf;strokeWidth=2;fontSize=10;" edge="1" source="audio-client" target="socketio-server" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e1-label" value="audio_data&lt;br&gt;(PCM16 @ 16kHz)" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#6c8ebf;fontStyle=1;" vertex="1" connectable="0" parent="e1">
+          <mxGeometry x="-0.1" relative="1" as="geometry">
+            <mxPoint y="-15" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Socket.IO → Audio Client (transcription) -->
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0;exitY=0.8;entryX=1;entryY=0.85;strokeColor=#82b366;strokeWidth=2;fontSize=10;dashed=1;" edge="1" source="socketio-server" target="audio-client" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="310" y="298" />
+              <mxPoint x="310" y="320" />
+              <mxPoint x="200" y="320" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e2-label" value="transcription" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#82b366;fontStyle=1;" vertex="1" connectable="0" parent="e2">
+          <mxGeometry x="0.2" relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Monitor Client → Socket.IO (subscribe_transcripts) -->
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.3;entryX=0;entryY=0.5;strokeColor=#d6b656;strokeWidth=2;fontSize=10;" edge="1" source="monitor-client" target="event-handlers" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3-label" value="subscribe_transcripts&lt;br&gt;cleanup_client" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#d6b656;fontStyle=1;" vertex="1" connectable="0" parent="e3">
+          <mxGeometry x="-0.1" relative="1" as="geometry">
+            <mxPoint y="-15" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Monitor Client ← Socket.IO (transcription via room) -->
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0;exitY=0.8;entryX=1;entryY=0.8;strokeColor=#82b366;strokeWidth=2;fontSize=10;dashed=1;" edge="1" source="rooms-box" target="monitor-client" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4-label" value="transcription&lt;br&gt;(via room broadcast)" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#82b366;fontStyle=1;" vertex="1" connectable="0" parent="e4">
+          <mxGeometry x="-0.1" relative="1" as="geometry">
+            <mxPoint y="-15" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Uvicorn → ASGIApp -->
+        <mxCell id="e5" style="rounded=1;orthogonalLoop=1;strokeColor=#9673a6;strokeWidth=1.5;" edge="1" source="uvicorn" target="asgi-app" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5-label" value="hosts" style="edgeLabel;html=1;fontSize=9;fontColor=#9673a6;" vertex="1" connectable="0" parent="e5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ASGIApp → Socket.IO -->
+        <mxCell id="e6" style="rounded=1;orthogonalLoop=1;strokeColor=#9673a6;strokeWidth=1.5;" edge="1" source="asgi-app" target="socketio-server" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6-label" value="wraps" style="edgeLabel;html=1;fontSize=9;fontColor=#9673a6;" vertex="1" connectable="0" parent="e6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Socket.IO → Event Handlers -->
+        <mxCell id="e7" style="rounded=1;orthogonalLoop=1;strokeColor=#b85450;strokeWidth=1.5;" edge="1" source="socketio-server" target="event-handlers" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7-label" value="dispatches" style="edgeLabel;html=1;fontSize=9;fontColor=#b85450;" vertex="1" connectable="0" parent="e7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Event Handlers → Rooms -->
+        <mxCell id="e7b" style="rounded=1;orthogonalLoop=1;strokeColor=#996185;strokeWidth=1.5;" edge="1" source="event-handlers" target="rooms-box" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7b-label" value="enter_room /&lt;br&gt;emit to room" style="edgeLabel;html=1;fontSize=9;fontColor=#996185;" vertex="1" connectable="0" parent="e7b">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Event Handlers → client_transcribers -->
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.2;entryX=0;entryY=0.5;strokeColor=#82b366;strokeWidth=1.5;" edge="1" source="event-handlers" target="client-transcribers-map" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8-label" value="create / lookup / delete" style="edgeLabel;html=1;fontSize=9;fontColor=#82b366;fontStyle=0;" vertex="1" connectable="0" parent="e8">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- client_transcribers → _ClientTranscriber -->
+        <mxCell id="e9" style="rounded=1;orthogonalLoop=1;strokeColor=#82b366;strokeWidth=1.5;" edge="1" source="client-transcribers-map" target="client-transcriber" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9-label" value="1 per client" style="edgeLabel;html=1;fontSize=9;fontColor=#82b366;" vertex="1" connectable="0" parent="e9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- _ClientTranscriber → Silero VAD -->
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;entryX=0.5;entryY=0;strokeColor=#d6b656;strokeWidth=2;" edge="1" source="client-transcriber" target="vad-model" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10-label" value="detect speech&lt;br&gt;segments" style="edgeLabel;html=1;fontSize=9;fontColor=#d6b656;fontStyle=1;" vertex="1" connectable="0" parent="e10">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="15" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Event Handlers → ThreadPool (transcribe_async) -->
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.7;entryX=0;entryY=0.5;strokeColor=#9673a6;strokeWidth=2;" edge="1" source="event-handlers" target="thread-pool" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="640" y="431" />
+              <mxPoint x="640" y="455" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11-label" value="_transcribe_async()" style="edgeLabel;html=1;fontSize=9;fontColor=#9673a6;fontStyle=1;" vertex="1" connectable="0" parent="e11">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ThreadPool → Whisper -->
+        <mxCell id="e12" style="rounded=1;orthogonalLoop=1;strokeColor=#d6b656;strokeWidth=2;" edge="1" source="thread-pool" target="whisper-model" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12-label" value="_transcribe_sync()" style="edgeLabel;html=1;fontSize=9;fontColor=#d6b656;fontStyle=1;" vertex="1" connectable="0" parent="e12">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="15" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Config → Server Boundary -->
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0;exitY=0.5;entryX=1;entryY=0.5;strokeColor=#666666;strokeWidth=1.5;dashed=1;dashPattern=5 3;" edge="1" source="config-file" target="client-transcribers-map" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13-label" value="from_config()" style="edgeLabel;html=1;fontSize=9;fontColor=#666666;" vertex="1" connectable="0" parent="e13">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Event Handlers → Callback -->
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#82b366;strokeWidth=1.5;dashed=1;" edge="1" source="event-handlers" target="callback" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1170" y="405" />
+              <mxPoint x="1170" y="340" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e14-label" value="on_transcription(text, client_id, duration)" style="edgeLabel;html=1;fontSize=9;fontColor=#82b366;fontStyle=0;" vertex="1" connectable="0" parent="e14">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Docker base → Docker app -->
+        <mxCell id="e15" style="rounded=1;orthogonalLoop=1;strokeColor=#4a86c8;strokeWidth=1.5;" edge="1" source="docker-base" target="docker-app" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15-label" value="FROM (base image)" style="edgeLabel;html=1;fontSize=9;fontColor=#4a86c8;" vertex="1" connectable="0" parent="e15">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Docker app → Server boundary -->
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;entryX=0.4;entryY=1;strokeColor=#4a86c8;strokeWidth=1.5;dashed=1;dashPattern=5 3;" edge="1" source="docker-app" target="server-boundary" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16-label" value="runs" style="edgeLabel;html=1;fontSize=9;fontColor=#4a86c8;" vertex="1" connectable="0" parent="e16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ============================================================ -->
+        <!-- DATA-FLOW LEGEND                                             -->
+        <!-- ============================================================ -->
+        <mxCell id="legend-box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#cccccc;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="760" width="210" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-title" value="&lt;b&gt;Legend&lt;/b&gt;" style="text;html=1;fontSize=11;align=left;verticalAlign=top;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="765" width="60" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1" value="" style="endArrow=classic;html=1;strokeColor=#6c8ebf;strokeWidth=2;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1120" y="800" as="sourcePoint" />
+            <mxPoint x="1180" y="800" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg1-lbl" value="Audio input" style="text;html=1;fontSize=10;align=left;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="792" width="100" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2" value="" style="endArrow=classic;html=1;strokeColor=#82b366;strokeWidth=2;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1120" y="822" as="sourcePoint" />
+            <mxPoint x="1180" y="822" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg2-lbl" value="Transcription output" style="text;html=1;fontSize=10;align=left;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="814" width="120" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3" value="" style="endArrow=classic;html=1;strokeColor=#d6b656;strokeWidth=2;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1120" y="844" as="sourcePoint" />
+            <mxPoint x="1180" y="844" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg3-lbl" value="ML inference" style="text;html=1;fontSize=10;align=left;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="836" width="100" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4" value="" style="endArrow=classic;html=1;strokeColor=#666666;strokeWidth=1.5;dashed=1;dashPattern=5 3;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1120" y="866" as="sourcePoint" />
+            <mxPoint x="1180" y="866" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg4-lbl" value="Configuration" style="text;html=1;fontSize=10;align=left;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="858" width="100" height="16" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
