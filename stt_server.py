@@ -6,6 +6,7 @@ pip install transformers accelerate python-socketio uvicorn silero-vad
 """
 
 import asyncio
+import math
 import socketio
 import uvicorn
 import torch
@@ -18,6 +19,70 @@ from typing import Optional, Callable, Dict, Any
 import logging
 import json
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Whisper hallucination defenses. Empirically validated against captured
+# failures (see project memory / data/probes/stt_real_audio_probe.py):
+#   - whisper-large-v3-turbo confidently emits "Thank you." / "Mm-hmm." on
+#     silence and on bass-heavy mouth noise.
+#   - P(<|nospeech|>) at the first decoder step is 0.0 for both cases —
+#     the model is not trained to flag these via the nospeech token.
+#   - Avg logprob is well above any usable threshold because once the
+#     model emits " Thank", subsequent tokens "you", "." follow at ~99%
+#     probability ("autoregressive lock-in").
+# Three layered defenses each catch a different signature:
+# ---------------------------------------------------------------------------
+
+# Layer 1 — pre-Whisper RMS gate. A clip below this energy level cannot
+# plausibly contain intelligible speech (typical conversational speech is
+# -20 to -25 dBFS RMS; soft whisper into a mic is -35 to -40 dBFS).
+# Catches the silence false-positives that escape Silero (e.g., the
+# 20260504_033626 file: -63.9 dBFS RMS, transcribed as "Thank you").
+MIN_AUDIO_RMS_DBFS = -45.0
+
+# Layer 2 — post-Whisper first-content-token probability gate. The
+# autoregressive lock-in inflates avg_logprob, but the FIRST content
+# token's probability accurately reflects the decoder's confidence in
+# what the audio actually says. On the captured failures: first-token
+# P("Thank") = 0.10 (mouth noise) and 0.29 (silence) — both well below
+# 0.6. On real speech the first content token is typically > 0.5.
+# Combined with the duration cap below to avoid clipping legitimate
+# short utterances where a real word has many plausible competitors.
+FIRST_TOKEN_PROB_THRESHOLD = 0.3
+SHORT_AUDIO_DURATION_S = 1.5
+
+# Layer 3 — post-Whisper canonical hallucination blocklist. When the
+# model hallucinates on a short clip, the output is heavily concentrated
+# on a small set of training-data sign-offs (YouTube end-of-video
+# captions are the dominant source). Match is normalised: case + non-
+# alphanumerics stripped, so "Thank you.", "thank you!", " Thank you "
+# all collapse to "thankyou". Only triggers on clips < SHORT_AUDIO_DURATION_S
+# so a real "Thank you" mid-conversation isn't dropped.
+HALLUCINATION_BLOCKLIST = {
+    "thankyou",
+    "thanksforwatching",
+    "thanksforwatchingthevideo",
+    "thanksforlistening",
+    "thanks",
+    "you",
+    "mmhmm",
+    "uhhuh",
+    "bye",
+    "byebye",
+    "goodbye",
+    "subscribe",
+    "subscribetothechannel",
+    "subscribetomychannel",
+    "amaraorg",
+    "amarasubtitles",
+    "transcriptionbyamaraorg",
+}
+
+
+def _normalize_for_blocklist(s: str) -> str:
+    """Lowercase + strip non-alphanumerics for blocklist comparison."""
+    return "".join(c.lower() for c in s if c.isalnum())
 
 
 class STTServer:
@@ -39,8 +104,8 @@ class STTServer:
         host: str = "0.0.0.0",
         on_transcription: Optional[Callable[[str, str, float], None]] = None,
         silence_duration: float = 0.8,
-        min_speech_duration: float = 0.4,
-        vad_threshold: float = 0.4,
+        min_speech_duration: float = 0.5,
+        vad_threshold: float = 0.5,
         processing_interval: float = 0.3,
         max_workers: int = 2,
         sample_rate: int = 16000,
@@ -333,22 +398,153 @@ class STTServer:
             # if self.enable_logging:
             #     print(f"🧵 Thread RELEASED {client_info} | Active: {self.active_transcriptions}/{self.max_workers}")
     
+    def _capture_segment(self, audio_data: np.ndarray, duration: float) -> None:
+        """Save a VAD-accepted segment to disk for offline inspection.
+
+        Writes a 16-bit PCM mono WAV named with timestamp and duration to
+        the bind-mounted /stt_server/data/captures/ directory (visible on
+        host at ~/env/assets/stt_server/data/captures/). Purely diagnostic;
+        no production logic depends on these files. Safe to wipe at will.
+        """
+        import os
+        import wave
+        from datetime import datetime
+        capture_dir = "/stt_server/data/captures"
+        os.makedirs(capture_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        fname = f"{ts}_{duration:.2f}s.wav"
+        fpath = os.path.join(capture_dir, fname)
+        # Convert float32 in [-1, 1] to int16 PCM
+        clipped = np.clip(audio_data, -1.0, 1.0)
+        pcm16 = (clipped * 32767.0).astype(np.int16)
+        with wave.open(fpath, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(pcm16.tobytes())
+        if self.enable_logging:
+            print(f"📁 Captured segment: {fname} ({len(pcm16)} samples)", flush=True)
+
     def _transcribe_sync(self, audio_segment: np.ndarray, client_id: str) -> str:
-        """Synchronous transcription function."""
+        """Synchronous transcription function.
+
+        Three-layer defense against the well-documented whisper-large-v3-turbo
+        hallucination class ("Thank you." / "Mm-hmm." on silence and on
+        bass-heavy mouth noise). See module-level constants and project
+        memory for the empirical justification.
+
+          1. Pre-Whisper RMS gate (MIN_AUDIO_RMS_DBFS): drop any segment
+             whose energy is below the no-speech-possible floor.
+          2. Whisper generate() pinned to language='en' / task='transcribe'
+             so auto-language-detect can't flip into Korean/Spanish
+             hallucinations on degenerate encoder outputs. (HF's built-in
+             no_speech_threshold / logprob_threshold / compression_ratio
+             only function in long-form mode and were empirically
+             confirmed inert against v3-turbo's "Thank you on silence"
+             failure class — see project memory.)
+          3. Post-Whisper short-clip filter: if duration < 1.5 s AND
+             (transcript matches the canonical hallucination blocklist
+             OR first-content-token probability < 0.6), return empty.
+        """
         self._log_thread_usage("start", f"({client_id})")
         try:
+            duration_s = len(audio_segment) / self.sample_rate
+
+            # ---- Layer 1: pre-Whisper RMS gate ------------------------
+            rms = float(np.sqrt(np.mean(audio_segment.astype(np.float32) ** 2)))
+            rms_dbfs = 20.0 * math.log10(rms + 1e-12)
+            if rms_dbfs < MIN_AUDIO_RMS_DBFS:
+                print(
+                    f"🔇 RMS_GATE_REJECT rms={rms_dbfs:.1f}dBFS "
+                    f"dur={duration_s:.2f}s",
+                    flush=True,
+                )
+                return ""
+
             inputs = self.processor(audio_segment, sampling_rate=self.sample_rate, return_tensors="pt") # type: ignore
             input_features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
-            
+
             with torch.inference_mode():
-                output_ids = self.whisper_model.generate( # type: ignore
+                # Note: dropped return_timestamps=True and the
+                # *_threshold filters. Those filters only function in
+                # HF Whisper's long-form generation path (audio > 30s),
+                # AND empirically don't catch v3-turbo's "Thank you on
+                # silence" failures even when active. Keeping them with
+                # return_dict_in_generate also auto-enables
+                # return_segments which changes .sequences into a list
+                # and breaks batch_decode. Our 3-layer external defense
+                # is what actually catches the failures.
+                gen_out = self.whisper_model.generate( # type: ignore
                     input_features,
                     max_new_tokens=200,
                     num_beams=1,
-                    do_sample=False
+                    do_sample=False,
+                    language="en",
+                    task="transcribe",
+                    condition_on_prev_tokens=False,
+                    temperature=0.0,
+                    return_dict_in_generate=True,
+                    output_scores=True,
                 )
-            
+
+            output_ids = gen_out.sequences if hasattr(gen_out, "sequences") else gen_out
             text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip() # type: ignore
+
+            if not text:
+                return ""
+
+            # ---- Layer 3: post-Whisper short-clip filter --------------
+            # Only applied to clips below SHORT_AUDIO_DURATION_S; longer
+            # clips are trusted (a real long utterance with the canonical
+            # phrase as part of it shouldn't be dropped).
+            if duration_s < SHORT_AUDIO_DURATION_S:
+                # 3a. Blocklist match (cheap; check first)
+                normalised = _normalize_for_blocklist(text)
+                if normalised in HALLUCINATION_BLOCKLIST:
+                    print(
+                        f"🚫 BLOCKLIST_REJECT text={text!r} "
+                        f"dur={duration_s:.2f}s",
+                        flush=True,
+                    )
+                    return ""
+
+                # 3b. First-content-token probability gate. With
+                # return_timestamps=True, the generated sequence begins
+                # with a timestamp token (e.g. <|0.00|>); the first
+                # non-special token after it is the first SPOKEN token.
+                # Its probability accurately reflects decoder confidence
+                # in what the audio actually says (avg logprob does not,
+                # because of autoregressive lock-in).
+                scores = getattr(gen_out, "scores", None)
+                if scores:
+                    seq = output_ids[0]
+                    n_generated = len(scores)
+                    gen_start = len(seq) - n_generated
+                    special_ids = set(self.processor.tokenizer.all_special_ids) # type: ignore
+                    first_token_p = None
+                    for i in range(n_generated):
+                        tok_id = int(seq[gen_start + i].item())
+                        if tok_id in special_ids:
+                            continue
+                        # Some timestamp tokens may not be in
+                        # all_special_ids depending on tokenizer; skip
+                        # any token whose decoded form is wrapped in
+                        # <|...|>.
+                        decoded_one = self.processor.tokenizer.decode([tok_id]) # type: ignore
+                        if decoded_one.startswith("<|") and decoded_one.endswith("|>"):
+                            continue
+                        # Found first content token at step i.
+                        logp = torch.log_softmax(scores[i][0].float(), dim=-1)[tok_id].item()
+                        first_token_p = math.exp(logp)
+                        break
+                    if first_token_p is not None and first_token_p < FIRST_TOKEN_PROB_THRESHOLD:
+                        print(
+                            f"❓ FIRST_TOKEN_REJECT P={first_token_p:.3f} "
+                            f"text={text!r} dur={duration_s:.2f}s",
+                            flush=True,
+                        )
+                        return ""
+
             return text
         except Exception as e:
             self.logger.error(f"Transcription error: {e}")
@@ -439,9 +635,19 @@ class STTServer:
                     if duration >= self.server.min_speech_duration:
                         audio_data = np.array(self.audio_buffer[start_sample:end_sample])
                         self.last_processed_time = end_time
-                        
-                        # if self.server.enable_logging:
-                        #     print(f"🎤 Found segment: {start_time:.1f}s-{end_time:.1f}s ({duration:.1f}s)")
+                        # DIAGNOSTIC: dump every segment that escapes Silero
+                        # before it reaches Whisper. Lets us inspect (listen,
+                        # FFT) the actual audio that triggers hallucinations
+                        # like the "MBC 뉴스 김성현입니다" Korean STT output
+                        # observed on a quiet room. Bind-mounted to host at
+                        # ~/env/assets/stt_server/data/captures/. Wipe
+                        # whenever — purely diagnostic, no production logic
+                        # depends on it.
+                        try:
+                            self.server._capture_segment(audio_data, duration)
+                        except Exception as _e:
+                            # Capture must never break the live STT pipeline
+                            self.server.logger.warning(f"capture failed: {_e}")
                         return audio_data
             
             return None
