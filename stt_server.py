@@ -59,7 +59,16 @@ SHORT_AUDIO_DURATION_S = 1.5
 # alphanumerics stripped, so "Thank you.", "thank you!", " Thank you "
 # all collapse to "thankyou". Only triggers on clips < SHORT_AUDIO_DURATION_S
 # so a real "Thank you" mid-conversation isn't dropped.
+#
+# Multi-language entries cover the canonical non-English Whisper
+# hallucinations on silence — added when we un-pinned `language` from 'en'
+# to support multilingual STT. Korean broadcast sign-offs and
+# language-specific "thanks for watching" / "subscribe" patterns are the
+# most reported. CJK characters survive the normalize-to-alphanum pass
+# (Python's str.isalnum() accepts them), so the entries below match
+# Whisper's typical normalisation output.
 HALLUCINATION_BLOCKLIST = {
+    # English (most common)
     "thankyou",
     "thanksforwatching",
     "thanksforwatchingthevideo",
@@ -77,6 +86,32 @@ HALLUCINATION_BLOCKLIST = {
     "amaraorg",
     "amarasubtitles",
     "transcriptionbyamaraorg",
+    # Korean — the most-reported non-English Whisper hallucination on
+    # silence (broadcast news sign-off pattern from training data).
+    "mbc뉴스김성현입니다",
+    "kbs뉴스",
+    "ytn뉴스",
+    "시청해주셔서감사합니다",  # "thanks for watching" sign-off
+    "구독과좋아요부탁드립니다",  # "subscribe and like" sign-off
+    # Japanese (similar end-of-video captions)
+    "ご視聴ありがとうございました",   # "thank you for watching"
+    "チャンネル登録お願いします",   # "please subscribe"
+    # Spanish
+    "graciasporver",
+    "graciasporverelvideo",
+    "suscribete",
+    "suscríbete",
+    # Brazilian Portuguese
+    "obrigadoporassistir",
+    "inscrevase",
+    "inscreva",
+    # French
+    "mercidavoirregardé",
+    "mercidavoirregarde",
+    "abonnezvous",
+    # Italian
+    "grazieperlavisione",
+    "iscriviti",
 }
 
 
@@ -435,13 +470,16 @@ class STTServer:
 
           1. Pre-Whisper RMS gate (MIN_AUDIO_RMS_DBFS): drop any segment
              whose energy is below the no-speech-possible floor.
-          2. Whisper generate() pinned to language='en' / task='transcribe'
-             so auto-language-detect can't flip into Korean/Spanish
-             hallucinations on degenerate encoder outputs. (HF's built-in
-             no_speech_threshold / logprob_threshold / compression_ratio
-             only function in long-form mode and were empirically
-             confirmed inert against v3-turbo's "Thank you on silence"
-             failure class — see project memory.)
+          2. Whisper generate() with auto-language-detect (language=None)
+             so Portuguese/Spanish/French/Italian/Japanese/etc. speech is
+             transcribed in the source language. We previously pinned
+             language='en' to suppress non-English hallucinations on
+             silence (e.g., the Korean "MBC 뉴스 김성현입니다."), but the
+             RMS gate (1) and first-token-probability gate (3b) are
+             language-agnostic and catch those degenerate inputs at the
+             source. Multi-language entries in HALLUCINATION_BLOCKLIST
+             cover the canonical sign-off hallucinations across the
+             languages we support.
           3. Post-Whisper short-clip filter: if duration < 1.5 s AND
              (transcript matches the canonical hallucination blocklist
              OR first-content-token probability < 0.6), return empty.
@@ -479,7 +517,13 @@ class STTServer:
                     max_new_tokens=200,
                     num_beams=1,
                     do_sample=False,
-                    language="en",
+                    # language=None → Whisper auto-detects the spoken
+                    # language (was pinned to 'en' previously to suppress
+                    # non-English hallucinations on silence; that role is
+                    # now covered by the RMS gate + first-token-P gate
+                    # which are both language-agnostic). Multi-language
+                    # entries in HALLUCINATION_BLOCKLIST cover the rest.
+                    language=None,
                     task="transcribe",
                     condition_on_prev_tokens=False,
                     temperature=0.0,
