@@ -50,7 +50,12 @@ MIN_AUDIO_RMS_DBFS = -45.0
 # Combined with the duration cap below to avoid clipping legitimate
 # short utterances where a real word has many plausible competitors.
 FIRST_TOKEN_PROB_THRESHOLD = 0.3
-SHORT_AUDIO_DURATION_S = 1.5
+# Was 1.5s. Lowered 2026-05-05 to stop swallowing brief intentional words
+# like "yes", "okay", "continue", "stop". Whisper's silence/mouth-noise
+# hallucinations are typically <1s anyway (the captured failures clustered
+# around 0.4-0.8s), so the filter still catches them at 1.0s while letting
+# real short replies through.
+SHORT_AUDIO_DURATION_S = 1.0
 
 # Layer 3 — post-Whisper canonical hallucination blocklist. When the
 # model hallucinates on a short clip, the output is heavily concentrated
@@ -118,6 +123,20 @@ HALLUCINATION_BLOCKLIST = {
 def _normalize_for_blocklist(s: str) -> str:
     """Lowercase + strip non-alphanumerics for blocklist comparison."""
     return "".join(c.lower() for c in s if c.isalnum())
+
+
+# Maximum unprocessed audio retained in a client's rolling buffer. Was
+# 10s previously; that aggressively truncated any utterance longer than
+# 10 seconds because the per-add_audio rebase dropped the front of the
+# buffer before VAD could detect end-of-speech and emit a segment to
+# Whisper. The user-visible symptom was "only the last 10-15 words make
+# it through" on speech longer than ~10s. 60s is a safer ceiling: 99%
+# of real utterances fit, memory stays cheap (~3.8 MB / client), and
+# Silero VAD on 60s of audio runs in well under processing_interval.
+# Note: Whisper-large-v3-turbo's encoder max is ~30s of audio; segments
+# longer than that still get truncated by the processor. Full > 30s
+# support needs chunked Whisper decoding (separate follow-up).
+MAX_BUFFER_SECONDS = 60
 
 
 class STTServer:
@@ -611,16 +630,42 @@ class STTServer:
             self.last_check_time = 0
         
         def add_audio(self, samples):
-            """Add audio samples to buffer."""
+            """Add audio samples to the per-client rolling buffer.
+
+            Two-phase trim:
+              1. Drop audio that's already been emitted as a transcribed
+                 segment. last_processed_time is the buffer-coordinate
+                 END time of the most recently processed VAD segment;
+                 everything before it is safe to discard. After the drop
+                 we rebase last_processed_time to 0 so the buffer is
+                 always in current coordinates.
+              2. Hard safety cap at MAX_BUFFER_SECONDS to bound memory
+                 and VAD compute on pathologically continuous speech
+                 (no silence_duration-long pause within this window).
+                 Reaching this cap re-introduces the original "drop the
+                 front of the unprocessed audio" behaviour, but only at
+                 the extreme tail (>60s of continuous speech) instead of
+                 the previous 10s.
+
+            Replaces the old "always keep only last 10s" rebase that
+            silently truncated any utterance longer than ~10 seconds.
+            """
             self.audio_buffer.extend(samples)
-            
-            # Keep only last 10 seconds
-            max_samples = self.server.sample_rate * 10
+
+            # Phase 1: drop already-processed audio.
+            if self.last_processed_time > 0:
+                n_processed = int(self.last_processed_time * self.server.sample_rate)
+                if 0 < n_processed <= len(self.audio_buffer):
+                    self.audio_buffer = self.audio_buffer[n_processed:]
+                    self.last_processed_time = 0.0
+
+            # Phase 2: safety cap.
+            max_samples = self.server.sample_rate * MAX_BUFFER_SECONDS
             if len(self.audio_buffer) > max_samples:
                 excess = len(self.audio_buffer) - max_samples
                 self.audio_buffer = self.audio_buffer[excess:]
-                removed_time = excess / self.server.sample_rate
-                self.last_processed_time = max(0, self.last_processed_time - removed_time)
+                # last_processed_time is already 0 from Phase 1; nothing
+                # else to adjust.
         
         def should_check_for_segments(self) -> bool:
             """Rate limit segment checking."""
