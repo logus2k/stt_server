@@ -125,18 +125,23 @@ def _normalize_for_blocklist(s: str) -> str:
     return "".join(c.lower() for c in s if c.isalnum())
 
 
-# Maximum unprocessed audio retained in a client's rolling buffer. Was
-# 10s previously; that aggressively truncated any utterance longer than
-# 10 seconds because the per-add_audio rebase dropped the front of the
-# buffer before VAD could detect end-of-speech and emit a segment to
-# Whisper. The user-visible symptom was "only the last 10-15 words make
-# it through" on speech longer than ~10s. 60s is a safer ceiling: 99%
-# of real utterances fit, memory stays cheap (~3.8 MB / client), and
-# Silero VAD on 60s of audio runs in well under processing_interval.
-# Note: Whisper-large-v3-turbo's encoder max is ~30s of audio; segments
-# longer than that still get truncated by the processor. Full > 30s
-# support needs chunked Whisper decoding (separate follow-up).
-MAX_BUFFER_SECONDS = 60
+# Maximum unprocessed audio retained in a client's rolling buffer.
+# History:
+#   Original:  10s rolling rebase (truncated >10s utterances at the front).
+#   2026-05-05: bumped to 60s to fix the truncation. That introduced a
+#               *VAD compute regression*: Silero VAD on a 60s buffer takes
+#               ~500-800ms on CPU, which exceeds processing_interval (0.3s).
+#               Once a long utterance accumulates, VAD runs back-to-back
+#               on the full buffer, never idle, CPU pegs at ~100%, and
+#               segment emissions stall by 15-20s.
+#   2026-05-06: lowered to 30s — matches Whisper-large-v3-turbo's native
+#               encoder cap (segments longer than 30s would be truncated
+#               by the processor anyway, so the 30→60 headroom was
+#               always wasted). Silero VAD on 30s runs in ~250-400ms,
+#               comfortably bounded under processing_interval most of
+#               the time. Full > 30s support requires chunked Whisper
+#               decoding (backlog STT-1).
+MAX_BUFFER_SECONDS = 30
 
 
 class STTServer:
@@ -368,12 +373,38 @@ class STTServer:
                 transcriber = self.client_transcribers[client_id]
                 transcriber.add_audio(samples.tolist())
 
+                # [DIAG] Audio flow: log every ~50 packets (~5s at 100ms packets) so
+                # we can see audio is reaching us. Tracks buffer growth too.
+                if not hasattr(transcriber, "_pkt_count"):
+                    transcriber._pkt_count = 0
+                transcriber._pkt_count += 1
+                if transcriber._pkt_count % 50 == 0:
+                    print(
+                        f"[DIAG] audio_data pkt#{transcriber._pkt_count} "
+                        f"client={client_id[:8]} buf_len={len(transcriber.audio_buffer)} "
+                        f"buf_s={len(transcriber.audio_buffer)/self.sample_rate:.1f}s "
+                        f"last_processed={transcriber.last_processed_time:.2f}s",
+                        flush=True,
+                    )
+
                 # Check for ready segments
                 audio_segment = transcriber.get_ready_segment()
                 if audio_segment is not None:
                     # Process segment
                     duration = len(audio_segment) / self.sample_rate
+                    print(
+                        f"[DIAG] segment READY client={client_id[:8]} "
+                        f"dur={duration:.2f}s — entering transcribe",
+                        flush=True,
+                    )
+                    _t0 = time.time()
                     text = await self._transcribe_async(audio_segment, client_id)
+                    _dt = time.time() - _t0
+                    print(
+                        f"[DIAG] transcribe DONE client={client_id[:8]} "
+                        f"wall={_dt:.2f}s text={text!r}",
+                        flush=True,
+                    )
 
                     if text and len(text.strip()) > 1:
                         if self.enable_logging:
