@@ -3,7 +3,7 @@ services:
     profiles:
       - default
       - full
-    restart: unless-stopped  
+    restart: unless-stopped
     image: stt_server:1.0
     container_name: stt_server
     hostname: stt_server
@@ -17,13 +17,56 @@ services:
     logging:
       options:
         max-size: "10m"
-        max-file: "3"    
+        max-file: "3"
     networks:
       logus2k_network:
     ports:
       - "2700:2700"
     volumes:
       - ~/env/assets/stt_server/data:/stt_server/data:ro
+
+  # v2: Parakeet TDT streaming. Same port, same network, same data mount
+  # so noted/agent_server don't have to change anything to talk to it.
+  # Only one of (stt_server, stt_server_v2) can run at a time — both bind
+  # to host port 2700. Switch via:
+  #   docker compose stop stt_server && docker compose --profile v2 up -d stt_server_v2
+  # Roll back with the inverse. The "v2" profile means it does NOT start
+  # by default; v1 stays in the default rotation.
+  stt_server_v2:
+    profiles:
+      - v2
+    restart: unless-stopped
+    image: stt_server:2.0
+    container_name: stt_server_v2
+    hostname: stt_server_v2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: "all"
+              capabilities: [gpu]
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      logus2k_network:
+        # Answer to BOTH our own hostname AND v1's hostname — agent_server
+        # hard-codes http://stt_server:2700, so the alias lets us drop in
+        # without touching agent_server. Only safe because v1 and v2 never
+        # run together (host port 2700 conflict).
+        aliases:
+          - stt_server
+    ports:
+      - "2700:2700"
+    volumes:
+      - ~/env/assets/stt_server/data:/stt_server/data:ro
+      # Bind-mount the v2 source so iteration is `docker restart
+      # stt_server_v2` (seconds) instead of a full image rebuild
+      # (minutes). Single-file mount on WSL2 has the inode-pinning
+      # gotcha — keep `restart` flow, not just file-edit.
+      - ~/env/assets/stt_server/stt_server_v2.py:/stt_server/stt_server_v2.py:ro
 
 networks:
   logus2k_network:
