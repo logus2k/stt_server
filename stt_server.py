@@ -373,38 +373,12 @@ class STTServer:
                 transcriber = self.client_transcribers[client_id]
                 transcriber.add_audio(samples.tolist())
 
-                # [DIAG] Audio flow: log every ~50 packets (~5s at 100ms packets) so
-                # we can see audio is reaching us. Tracks buffer growth too.
-                if not hasattr(transcriber, "_pkt_count"):
-                    transcriber._pkt_count = 0
-                transcriber._pkt_count += 1
-                if transcriber._pkt_count % 50 == 0:
-                    print(
-                        f"[DIAG] audio_data pkt#{transcriber._pkt_count} "
-                        f"client={client_id[:8]} buf_len={len(transcriber.audio_buffer)} "
-                        f"buf_s={len(transcriber.audio_buffer)/self.sample_rate:.1f}s "
-                        f"last_processed={transcriber.last_processed_time:.2f}s",
-                        flush=True,
-                    )
-
                 # Check for ready segments
                 audio_segment = transcriber.get_ready_segment()
                 if audio_segment is not None:
                     # Process segment
                     duration = len(audio_segment) / self.sample_rate
-                    print(
-                        f"[DIAG] segment READY client={client_id[:8]} "
-                        f"dur={duration:.2f}s — entering transcribe",
-                        flush=True,
-                    )
-                    _t0 = time.time()
                     text = await self._transcribe_async(audio_segment, client_id)
-                    _dt = time.time() - _t0
-                    print(
-                        f"[DIAG] transcribe DONE client={client_id[:8]} "
-                        f"wall={_dt:.2f}s text={text!r}",
-                        flush=True,
-                    )
 
                     if text and len(text.strip()) > 1:
                         if self.enable_logging:
@@ -483,32 +457,6 @@ class STTServer:
             # if self.enable_logging:
             #     print(f"🧵 Thread RELEASED {client_info} | Active: {self.active_transcriptions}/{self.max_workers}")
     
-    def _capture_segment(self, audio_data: np.ndarray, duration: float) -> None:
-        """Save a VAD-accepted segment to disk for offline inspection.
-
-        Writes a 16-bit PCM mono WAV named with timestamp and duration to
-        the bind-mounted /stt_server/data/captures/ directory (visible on
-        host at ~/env/assets/stt_server/data/captures/). Purely diagnostic;
-        no production logic depends on these files. Safe to wipe at will.
-        """
-        import os
-        import wave
-        from datetime import datetime
-        capture_dir = "/stt_server/data/captures"
-        os.makedirs(capture_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        fname = f"{ts}_{duration:.2f}s.wav"
-        fpath = os.path.join(capture_dir, fname)
-        # Convert float32 in [-1, 1] to int16 PCM
-        clipped = np.clip(audio_data, -1.0, 1.0)
-        pcm16 = (clipped * 32767.0).astype(np.int16)
-        with wave.open(fpath, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(pcm16.tobytes())
-        if self.enable_logging:
-            print(f"📁 Captured segment: {fname} ({len(pcm16)} samples)", flush=True)
 
     def _transcribe_sync(self, audio_segment: np.ndarray, client_id: str) -> str:
         """Synchronous transcription function.
@@ -659,7 +607,7 @@ class STTServer:
             self.audio_buffer = []
             self.last_processed_time = 0
             self.last_check_time = 0
-        
+
         def add_audio(self, samples):
             """Add audio samples to the per-client rolling buffer.
 
@@ -755,21 +703,8 @@ class STTServer:
                     if duration >= self.server.min_speech_duration:
                         audio_data = np.array(self.audio_buffer[start_sample:end_sample])
                         self.last_processed_time = end_time
-                        # DIAGNOSTIC: dump every segment that escapes Silero
-                        # before it reaches Whisper. Lets us inspect (listen,
-                        # FFT) the actual audio that triggers hallucinations
-                        # like the "MBC 뉴스 김성현입니다" Korean STT output
-                        # observed on a quiet room. Bind-mounted to host at
-                        # ~/env/assets/stt_server/data/captures/. Wipe
-                        # whenever — purely diagnostic, no production logic
-                        # depends on it.
-                        try:
-                            self.server._capture_segment(audio_data, duration)
-                        except Exception as _e:
-                            # Capture must never break the live STT pipeline
-                            self.server.logger.warning(f"capture failed: {_e}")
                         return audio_data
-            
+
             return None
     
     async def start(self):
