@@ -15,6 +15,7 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 import silero_vad
 from concurrent.futures import ThreadPoolExecutor
 import time
+import zlib
 from typing import Optional, Callable, Dict, Any
 import logging
 import json
@@ -143,6 +144,16 @@ def _normalize_for_blocklist(s: str) -> str:
 #               decoding (backlog STT-1).
 MAX_BUFFER_SECONDS = 30
 
+# `transcribe` (whole clips, e.g. Cortex's diarized speaker turns). Measured on
+# meeting audio: Whisper decoding each turn with the language fixed made 5-16
+# errors per 5 min where the streaming recogniser made 30-37; the same audio
+# given whole looped ("não, não, ..." x219). These guards are Whisper's own
+# (temperature fallback on a compression ratio above 2.4) plus a speech-rate cap.
+CLIP_PIECE_SECONDS = 28.0
+CLIP_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+CLIP_MAX_COMPRESSION = 2.4
+CLIP_MAX_WORDS_PER_SECOND = 6.0
+
 
 class STTServer:
     """
@@ -204,6 +215,7 @@ class STTServer:
         self.whisper_model = None
         self.processor = None
         self.vad_model = None
+        self.clip_vad_model = None
         self.thread_pool = None
         self.server = None
         self.active_transcriptions = 0
@@ -213,7 +225,10 @@ class STTServer:
             cors_allowed_origins="*",
             logger=False,  # ✅ Disable Socket.IO internal logging
             engineio_logger=False,  # ✅ Disable EngineIO internal logging
-            async_mode='asgi'
+            async_mode='asgi',
+            # `transcribe` carries a whole speaker turn (PCM16 16 kHz = 32 KB/s); the
+            # default 1 MB dropped the connection on turns over ~31 s (measured)
+            max_http_buffer_size=32 * 1024 * 1024
         )
         self.app = socketio.ASGIApp(self.sio, other_asgi_app=None)
         
@@ -373,12 +388,38 @@ class STTServer:
                 transcriber = self.client_transcribers[client_id]
                 transcriber.add_audio(samples.tolist())
 
+                # [DIAG] Audio flow: log every ~50 packets (~5s at 100ms packets) so
+                # we can see audio is reaching us. Tracks buffer growth too.
+                if not hasattr(transcriber, "_pkt_count"):
+                    transcriber._pkt_count = 0
+                transcriber._pkt_count += 1
+                if transcriber._pkt_count % 50 == 0:
+                    print(
+                        f"[DIAG] audio_data pkt#{transcriber._pkt_count} "
+                        f"client={client_id[:8]} buf_len={len(transcriber.audio_buffer)} "
+                        f"buf_s={len(transcriber.audio_buffer)/self.sample_rate:.1f}s "
+                        f"last_processed={transcriber.last_processed_time:.2f}s",
+                        flush=True,
+                    )
+
                 # Check for ready segments
                 audio_segment = transcriber.get_ready_segment()
                 if audio_segment is not None:
                     # Process segment
                     duration = len(audio_segment) / self.sample_rate
+                    print(
+                        f"[DIAG] segment READY client={client_id[:8]} "
+                        f"dur={duration:.2f}s — entering transcribe",
+                        flush=True,
+                    )
+                    _t0 = time.time()
                     text = await self._transcribe_async(audio_segment, client_id)
+                    _dt = time.time() - _t0
+                    print(
+                        f"[DIAG] transcribe DONE client={client_id[:8]} "
+                        f"wall={_dt:.2f}s text={text!r}",
+                        flush=True,
+                    )
 
                     if text and len(text.strip()) > 1:
                         if self.enable_logging:
@@ -423,7 +464,24 @@ class STTServer:
 
             await self.sio.emit("subscribed", {"clientId": client_id}, room=sid)
 
-    
+        @self.sio.event
+        async def transcribe(sid, data):
+            """Transcribe one finished clip (called with an ack, e.g. `await client.call(...)`).
+
+            data: {"audio": PCM16 16 kHz mono bytes, "language": Whisper code such as "pt"
+            or None (detect)}. Answers {"text": str, "rejected": reason or None}.
+            Used by Cortex to re-transcribe each diarized speaker turn after its fast
+            streaming draft; the live `audio_data` path above is unaffected."""
+            data = data or {}
+            audio = data.get("audio")
+            if not isinstance(audio, (bytes, bytearray)) or len(audio) < 2:
+                return {"text": "", "rejected": "no audio"}
+            pcm = np.frombuffer(bytes(audio[: len(audio) - len(audio) % 2]), dtype=np.int16).astype(np.float32) / 32768.0
+            language = data.get("language") or None
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language)
+
+
     async def initialize(self):
         """Load models and initialize components."""
         print("🔄 Loading Whisper model...")
@@ -594,6 +652,74 @@ class STTServer:
         finally:
             self._log_thread_usage("end", f"({client_id})")
     
+    def _clip_pieces(self, pcm: np.ndarray) -> list[np.ndarray]:
+        """A clip in pieces of at most CLIP_PIECE_SECONDS (Whisper's window is 30 s),
+        cut at the pauses Silero VAD finds; a longer unbroken run is cut at the limit."""
+        limit = int(CLIP_PIECE_SECONDS * self.sample_rate)
+        if len(pcm) <= limit:
+            return [pcm]
+        if self.clip_vad_model is None:     # its own instance: the live path uses vad_model on the event loop
+            self.clip_vad_model = silero_vad.load_silero_vad()
+        spans = silero_vad.get_speech_timestamps(torch.from_numpy(pcm), self.clip_vad_model,
+                                                 sampling_rate=self.sample_rate, threshold=self.vad_threshold)
+        if not spans:
+            return []
+        pieces, start, end = [], spans[0]["start"], spans[0]["start"]
+        for s in spans:
+            if s["end"] - start > limit and end > start:        # this span would overflow: close the piece
+                pieces.append((start, end))
+                start = s["start"]
+            while s["end"] - start > limit:                     # one span longer than the limit
+                pieces.append((start, start + limit))
+                start += limit
+            end = s["end"]
+        pieces.append((start, end))
+        pad = int(0.2 * self.sample_rate)
+        return [pcm[max(0, a - pad):min(len(pcm), b + pad)] for a, b in pieces if b > a]
+
+    def _decode_piece(self, features, language: Optional[str], temperature: float) -> str:
+        kw = dict(max_new_tokens=440, num_beams=1, task="transcribe", language=language,
+                  condition_on_prev_tokens=False)
+        if temperature > 0:
+            kw.update(do_sample=True, temperature=temperature)
+        else:
+            kw.update(do_sample=False)
+        with torch.inference_mode():
+            out = self.whisper_model.generate(features, **kw)  # type: ignore
+        return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()  # type: ignore
+
+    def _transcribe_clip_sync(self, pcm: np.ndarray, language: Optional[str]) -> dict:
+        """Whisper on one clip with the language given. Each piece is decoded greedily and,
+        as in Whisper's own decoding, again at rising temperatures while the text repeats
+        itself (zlib compression ratio above CLIP_MAX_COMPRESSION) or holds more words than
+        the audio could (CLIP_MAX_WORDS_PER_SECOND); a piece that never passes is rejected."""
+        self._log_thread_usage("start", "(clip)")
+        try:
+            rms = float(np.sqrt(np.mean(pcm ** 2)))
+            if 20.0 * math.log10(rms + 1e-12) < MIN_AUDIO_RMS_DBFS:
+                return {"text": "", "rejected": "silence"}
+            texts = []
+            for piece in self._clip_pieces(pcm):
+                seconds = len(piece) / self.sample_rate
+                inputs = self.processor(piece, sampling_rate=self.sample_rate, return_tensors="pt")  # type: ignore
+                features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
+                for temperature in CLIP_TEMPERATURES:
+                    text = self._decode_piece(features, language, temperature)
+                    raw = text.encode("utf-8")
+                    ratio = len(raw) / max(1, len(zlib.compress(raw)))
+                    if ratio <= CLIP_MAX_COMPRESSION and len(text.split()) <= CLIP_MAX_WORDS_PER_SECOND * seconds + 2:
+                        break
+                else:
+                    print(f"🔁 CLIP_REJECT repetition dur={seconds:.1f}s text={text[:80]!r}", flush=True)
+                    return {"text": "", "rejected": "repetition"}
+                texts.append(text)
+            return {"text": " ".join(t for t in texts if t), "rejected": None}
+        except Exception as e:
+            self.logger.error(f"Clip transcription error: {e}")
+            return {"text": "", "rejected": f"error: {e}"}
+        finally:
+            self._log_thread_usage("end", "(clip)")
+
     async def _transcribe_async(self, audio_segment: np.ndarray, client_id: str) -> str:
         """Async wrapper for transcription."""
         loop = asyncio.get_event_loop()
@@ -703,6 +829,33 @@ class STTServer:
                     if duration >= self.server.min_speech_duration:
                         audio_data = np.array(self.audio_buffer[start_sample:end_sample])
                         self.last_processed_time = end_time
+                        return audio_data
+
+            # Force-flush safety net: the buffer is at/near the hard cap and no
+            # segment was silence-terminated (continuous speech with no
+            # >= silence_duration gap). Emit the first unprocessed speech
+            # segment anyway so the buffer drains instead of pinning at the
+            # cap — which otherwise pegs VAD on a full 30s buffer every
+            # interval, stalls all transcription for this client, and starves
+            # the event loop. Coarser (segment isn't silence-terminated) but
+            # far better than never transcribing.
+            if buffer_duration >= MAX_BUFFER_SECONDS - 1.0:
+                for segment in segments:
+                    start_sample = segment['start']
+                    end_sample = segment['end']
+                    start_time = start_sample / self.server.sample_rate
+                    end_time = end_sample / self.server.sample_rate
+                    if start_time <= self.last_processed_time:
+                        continue
+                    duration = (end_sample - start_sample) / self.server.sample_rate
+                    if duration >= self.server.min_speech_duration:
+                        audio_data = np.array(self.audio_buffer[start_sample:end_sample])
+                        self.last_processed_time = end_time
+                        print(
+                            f"[DIAG] FORCE-FLUSH at {buffer_duration:.1f}s cap: "
+                            f"emitting {duration:.1f}s segment (no trailing silence)",
+                            flush=True,
+                        )
                         return audio_data
 
             return None
