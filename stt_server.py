@@ -153,6 +153,9 @@ CLIP_PIECE_SECONDS = 28.0
 CLIP_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 CLIP_MAX_COMPRESSION = 2.4
 CLIP_MAX_WORDS_PER_SECOND = 6.0
+# `transcribe`'s optional prompt (e.g. a vocabulary of names): Whisper was trained with at
+# most 224 prompt tokens, and prompt + transcript share the decoder's 448 positions.
+CLIP_MAX_PROMPT_TOKENS = 200
 
 
 class STTServer:
@@ -469,7 +472,8 @@ class STTServer:
             """Transcribe one finished clip (called with an ack, e.g. `await client.call(...)`).
 
             data: {"audio": PCM16 16 kHz mono bytes, "language": Whisper code such as "pt"
-            or None (detect)}. Answers {"text": str, "rejected": reason or None}.
+            or None (detect), "prompt": optional text Whisper takes as preceding context, e.g.
+            a vocabulary of names}. Answers {"text": str, "rejected": reason or None}.
             Used by Cortex to re-transcribe each diarized speaker turn after its fast
             streaming draft; the live `audio_data` path above is unaffected."""
             data = data or {}
@@ -478,8 +482,9 @@ class STTServer:
                 return {"text": "", "rejected": "no audio"}
             pcm = np.frombuffer(bytes(audio[: len(audio) - len(audio) % 2]), dtype=np.int16).astype(np.float32) / 32768.0
             language = data.get("language") or None
+            prompt = (data.get("prompt") or "").strip() or None
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language)
+            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language, prompt)
 
 
     async def initialize(self):
@@ -677,9 +682,15 @@ class STTServer:
         pad = int(0.2 * self.sample_rate)
         return [pcm[max(0, a - pad):min(len(pcm), b + pad)] for a, b in pieces if b > a]
 
-    def _decode_piece(self, features, language: Optional[str], temperature: float) -> str:
+    def _decode_piece(self, features, language: Optional[str], temperature: float, prompt: Optional[str] = None) -> str:
         kw = dict(max_new_tokens=440, num_beams=1, task="transcribe", language=language,
                   condition_on_prev_tokens=False)
+        if prompt:
+            ids = self.processor.get_prompt_ids(prompt, return_tensors="pt").to(self.device)  # type: ignore
+            if len(ids) > CLIP_MAX_PROMPT_TOKENS:
+                raise ValueError(f"prompt is {len(ids)} tokens; at most {CLIP_MAX_PROMPT_TOKENS}")
+            # the decoder holds 448 positions: start tokens + prompt + the transcript
+            kw.update(prompt_ids=ids, max_new_tokens=444 - len(ids))
         if temperature > 0:
             kw.update(do_sample=True, temperature=temperature)
         else:
@@ -688,7 +699,7 @@ class STTServer:
             out = self.whisper_model.generate(features, **kw)  # type: ignore
         return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()  # type: ignore
 
-    def _transcribe_clip_sync(self, pcm: np.ndarray, language: Optional[str]) -> dict:
+    def _transcribe_clip_sync(self, pcm: np.ndarray, language: Optional[str], prompt: Optional[str] = None) -> dict:
         """Whisper on one clip with the language given. Each piece is decoded greedily and,
         as in Whisper's own decoding, again at rising temperatures while the text repeats
         itself (zlib compression ratio above CLIP_MAX_COMPRESSION) or holds more words than
@@ -704,7 +715,7 @@ class STTServer:
                 inputs = self.processor(piece, sampling_rate=self.sample_rate, return_tensors="pt")  # type: ignore
                 features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
                 for temperature in CLIP_TEMPERATURES:
-                    text = self._decode_piece(features, language, temperature)
+                    text = self._decode_piece(features, language, temperature, prompt)
                     raw = text.encode("utf-8")
                     ratio = len(raw) / max(1, len(zlib.compress(raw)))
                     if ratio <= CLIP_MAX_COMPRESSION and len(text.split()) <= CLIP_MAX_WORDS_PER_SECOND * seconds + 2:
