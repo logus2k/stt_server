@@ -16,6 +16,7 @@ import silero_vad
 from concurrent.futures import ThreadPoolExecutor
 import time
 import zlib
+from collections import deque
 from typing import Optional, Callable, Dict, Any
 import logging
 import json
@@ -153,6 +154,37 @@ CLIP_PIECE_SECONDS = 28.0
 CLIP_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 CLIP_MAX_COMPRESSION = 2.4
 CLIP_MAX_WORDS_PER_SECOND = 6.0
+# Live segments of a sender that passes `language` in audio_data (opt-in; Cortex): decoded as clips
+# (language fixed, the checks above) after raising quiet speech. Measured 2026-09-29 on phone and room
+# recordings arriving at -42 to -60 dBFS: the live path's RMS gate dropped them as silence (a sonnet read
+# into a phone: every segment), while the clip decoder with the language fixed and the audio raised
+# transcribed the same readings with 2 errors in 99 words. One gain per segment: its RMS to
+# LIVE_TARGET_DBFS, never lowered, capped so the loudest sample stays below LIVE_PEAK_DBFS and by
+# LIVE_MAX_GAIN_DB; a segment below LIVE_MIN_RMS_DBFS is still silence.
+LIVE_TARGET_DBFS = -20.0
+LIVE_PEAK_DBFS = -1.0
+LIVE_MAX_GAIN_DB = 40.0
+LIVE_MIN_RMS_DBFS = -65.0
+# ...and raised BEFORE the VAD decides where speech is: on audio arriving at -60 dBFS (a TV across a room)
+# Silero found 15 s of 76 s of speech; raised first, all of it (measured 2026-09-30). The gain follows the
+# stream: its 90th-percentile packet level over the last LIVE_LEVEL_WINDOW packets brought to
+# LIVE_TARGET_DBFS (never lowered, at most LIVE_MAX_GAIN_DB), with a soft limiter against clipping.
+LIVE_LEVEL_WINDOW = 300          # packets (~30 s of 100 ms packets)
+# the gain is also capped by the loudest peak of the last LIVE_PEAK_WINDOW packets (the current one among
+# them): at the start the level window holds only silence, and the first words, raised as much as that
+# silence, were flattened by the limiter ("Como" lost). Over the whole level window, one click at -22 dBFS
+# held a TV's speech (-60 dBFS) to +20 dB, too quiet for the VAD (76 s of speech -> 38 s found).
+LIVE_PEAK_WINDOW = 10            # packets (~1 s)
+# the pause that ends a segment for opt-in senders (they may choose it: `pause` in audio_data)
+LIVE_PAUSE_RANGE = (0.3, 5.0)
+# opt-in: speech shorter than this is not a segment. Raised background noise made 0.3-0.7 s segments that
+# Whisper turned into "Obrigado.", "Nossa.", "Seus amigos." (a meeting room, measured 2026-09-30)
+LIVE_MIN_SPEECH_SEC = 1.0
+# opt-in: a segment forced out at the buffer cap is cut at the quietest LIVE_CUT_QUIET_SEC of its last
+# LIVE_CUT_SEARCH_SEC (the rest stays in the buffer for the next one)
+LIVE_CUT_QUIET_SEC = 0.3
+LIVE_CUT_SEARCH_SEC = 4.0
+
 # `transcribe`'s optional prompt (e.g. a vocabulary of names): Whisper was trained with at
 # most 224 prompt tokens, and prompt + transcript share the decoder's 448 positions.
 CLIP_MAX_PROMPT_TOKENS = 200
@@ -235,8 +267,13 @@ class STTServer:
         )
         self.app = socketio.ASGIApp(self.sio, other_asgi_app=None)
         
-        # Client transcriber storage
+        # Client transcriber storage, keyed by the clientId a sender chose (or client-<sid>)
         self.client_transcribers = {}
+        # the clientIds each connection sent audio under: freed when it disconnects (keyed by
+        # clientId, a transcriber outlived its connection - memory kept for good, and a sender
+        # reconnecting under the same clientId had the old connection's leftover audio
+        # transcribed into its new session; measured 2026-09-29)
+        self.sid_clients: Dict[str, set] = {}
         
         # Setup Socket.IO event handlers
         self._setup_socketio_handlers()
@@ -288,9 +325,12 @@ class STTServer:
             if self.enable_logging:
                 print(f"❌ Session ENDED: {client_info}")
             
-            # Clean up transcriber
-            if sid in self.client_transcribers:
-                del self.client_transcribers[sid]
+            # Clean up its transcribers: the one made on connect, and those of the clientIds it
+            # sent audio under, unless another connection still sends under the same clientId
+            self.client_transcribers.pop(sid, None)
+            for client_id in self.sid_clients.pop(sid, set()):
+                if not any(client_id in ids for ids in self.sid_clients.values()):
+                    self.client_transcribers.pop(client_id, None)
 
         @self.sio.event
         async def client_disconnected(sid, data):
@@ -360,9 +400,58 @@ class STTServer:
             #     print(f"✅ Cleanup completed for client: {client_id}, removed {len(cleaned_sessions)} sessions")
 
 
+        async def emit_segment(sid, client_id, transcriber, audio_segment, span):
+            """Transcribe one segment and send it to the sender and the clientId's room. Opt-in senders
+            (transcriber.clip) get the clip decoder and a transcription even when it was rejected
+            (empty text, `rejected` set), so they know the span was handled."""
+            transcriber.inflight += 1
+            try:
+                await _emit_segment(sid, client_id, transcriber, audio_segment, span)
+            finally:
+                transcriber.inflight -= 1
+
+        async def _emit_segment(sid, client_id, transcriber, audio_segment, span):
+            duration = len(audio_segment) / self.sample_rate
+            print(f"[DIAG] segment READY client={client_id[:8]} dur={duration:.2f}s — entering transcribe", flush=True)
+            _t0 = time.time()
+            rejected, result = None, {}
+            if transcriber.clip:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(self.thread_pool, self._transcribe_live_clip_sync,
+                                                    audio_segment.astype(np.float32), transcriber.language)
+                text, rejected = (result.get("text") or "").strip(), result.get("rejected")
+            else:
+                text = await self._transcribe_async(audio_segment, client_id)
+            print(f"[DIAG] transcribe DONE client={client_id[:8]} wall={time.time() - _t0:.2f}s text={text!r}", flush=True)
+            if not transcriber.clip and not (text and len(text.strip()) > 1):
+                return
+            if text and self.enable_logging:
+                print(f"🗣️ [{duration:.1f}s] {client_id}: {text}")
+            payload = {"text": text, "duration": duration, "client_id": client_id, "ts": time.time(),
+                       # the segment's place in the sender's stream, in seconds from its first audio
+                       "start": round(span[0], 3), "end": round(span[1], 3)}
+            if transcriber.clip:
+                payload["rejected"] = rejected
+                # each word [text, start, end] in stream seconds (Cortex gives each word its speaker)
+                payload["words"] = [[w, round(span[0] + a, 3), round(span[0] + b, 3)]
+                                    for seg in (result.get("segments") or []) for w, a, b in seg["words"]]
+            # to everyone subscribed to this clientId (e.g., agent_server), the sender among them
+            await self.sio.emit("transcription", payload, room=client_id)
+            # LEGACY: also to the sender's own socket (so a legacy sender gets each one twice; kept
+            # for the apps written against it). Opt-in senders get it once.
+            if not transcriber.clip:
+                await self.sio.emit("transcription", payload, room=sid)
+            if text and self.on_transcription:
+                try:
+                    self.on_transcription(text, client_id, duration)
+                except Exception as e:
+                    self.logger.error(f"Error in transcription callback: {e}")
+
         @self.sio.event
         async def audio_data(sid, data):
-            """Handle incoming audio data."""
+            """Handle incoming audio data: {audioData: PCM16 16 kHz mono bytes, clientId, language?}
+            (or raw bytes, legacy). `language` present (a Whisper code such as "pt", or null to
+            detect) opts the clientId into the clip decoder (_transcribe_live_clip_sync)."""
             try:
                 # Handle new format with client ID
                 if isinstance(data, dict) and 'audioData' in data and 'clientId' in data:
@@ -375,12 +464,19 @@ class STTServer:
 
                 # Ensure the sender is in the client_id room (idempotent)
                 await self.sio.enter_room(sid, client_id)
+                self.sid_clients.setdefault(sid, set()).add(client_id)
 
                 # CREATE OR GET TRANSCRIBER USING THE CLIENT_ID (not sid)
                 if client_id not in self.client_transcribers:
                     if self.enable_logging:
                         print(f"🆕 Session CREATED: {client_id}")
                     self.client_transcribers[client_id] = self._ClientTranscriber(self)
+                transcriber = self.client_transcribers[client_id]
+                if isinstance(data, dict) and "language" in data:
+                    transcriber.clip, transcriber.language = True, data.get("language") or None
+                    transcriber.min_speech = LIVE_MIN_SPEECH_SEC
+                    if data.get("pause") is not None:
+                        transcriber.pause = float(np.clip(float(data["pause"]), *LIVE_PAUSE_RANGE))
 
                 # Convert binary PCM16 -> float32 (-1..1)
                 if isinstance(audio_data, (bytes, bytearray)):
@@ -388,7 +484,8 @@ class STTServer:
                 else:
                     return  # unsupported format (keep silent to avoid log spam)
 
-                transcriber = self.client_transcribers[client_id]
+                if transcriber.clip:
+                    samples = transcriber.raise_level(samples)
                 transcriber.add_audio(samples.tolist())
 
                 # [DIAG] Audio flow: log every ~50 packets (~5s at 100ms packets) so
@@ -408,49 +505,33 @@ class STTServer:
                 # Check for ready segments
                 audio_segment = transcriber.get_ready_segment()
                 if audio_segment is not None:
-                    # Process segment
-                    duration = len(audio_segment) / self.sample_rate
-                    print(
-                        f"[DIAG] segment READY client={client_id[:8]} "
-                        f"dur={duration:.2f}s — entering transcribe",
-                        flush=True,
-                    )
-                    _t0 = time.time()
-                    text = await self._transcribe_async(audio_segment, client_id)
-                    _dt = time.time() - _t0
-                    print(
-                        f"[DIAG] transcribe DONE client={client_id[:8]} "
-                        f"wall={_dt:.2f}s text={text!r}",
-                        flush=True,
-                    )
-
-                    if text and len(text.strip()) > 1:
-                        if self.enable_logging:
-                            print(f"🗣️ [{duration:.1f}s] {client_id}: {text}")
-
-                        payload = {
-                            "text": text,
-                            "duration": duration,
-                            "client_id": client_id,
-                            "ts": time.time(),
-                        }
-
-                        # NEW: broadcast to everyone subscribed to this clientId (e.g., agent_server)
-                        await self.sio.emit("transcription", payload, room=client_id)
-
-                        # LEGACY: also emit to the audio sender socket (keeps old clients working)
-                        await self.sio.emit("transcription", payload, room=sid)
-
-                        # Optional user callback
-                        if self.on_transcription:
-                            try:
-                                self.on_transcription(text, client_id, duration)
-                            except Exception as e:
-                                self.logger.error(f"Error in transcription callback: {e}")
+                    await emit_segment(sid, client_id, transcriber, audio_segment, transcriber.last_span)
 
             except Exception as e:
                 self.logger.error(f"Error processing audio from {sid}: {e}")
 
+        @self.sio.event
+        async def audio_end(sid, data):
+            """The sender's audio for a clientId has ended ({clientId}, with an ack): the speech still
+            in its buffer is transcribed and sent now, without waiting for a pause after it. Answers
+            {"segments": n} once they are all sent."""
+            client_id = (data or {}).get("clientId") or f"client-{sid[:8]}"
+            transcriber = self.client_transcribers.get(client_id)
+            if transcriber is None:
+                return {"segments": 0}
+            # segments already being transcribed are sent before this answers (the sender may disconnect then)
+            waited = 0.0
+            while transcriber.inflight and waited < 120:
+                await asyncio.sleep(0.05)
+                waited += 0.05
+            held = len(transcriber.audio_buffer) / self.sample_rate
+            last = transcriber.last_processed_time
+            pending = transcriber.remaining_segments()
+            print(f"[DIAG] audio_end client={client_id[:8]} buffer={held:.1f}s last_processed={last:.2f}s "
+                  f"waited={waited:.2f}s segments={[(round(a, 1), round(b, 1)) for _, (a, b) in pending]}", flush=True)
+            for audio_segment, span in pending:
+                await emit_segment(sid, client_id, transcriber, audio_segment, span)
+            return {"segments": len(pending)}
 
         @self.sio.event
         async def subscribe_transcripts(sid, data):
@@ -483,8 +564,9 @@ class STTServer:
             pcm = np.frombuffer(bytes(audio[: len(audio) - len(audio) % 2]), dtype=np.int16).astype(np.float32) / 32768.0
             language = data.get("language") or None
             prompt = (data.get("prompt") or "").strip() or None
+            words = bool(data.get("words"))       # each piece's words with their times (segments)
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language, prompt)
+            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language, prompt, words)
 
 
     async def initialize(self):
@@ -657,12 +739,12 @@ class STTServer:
         finally:
             self._log_thread_usage("end", f"({client_id})")
     
-    def _clip_pieces(self, pcm: np.ndarray) -> list[np.ndarray]:
-        """A clip in pieces of at most CLIP_PIECE_SECONDS (Whisper's window is 30 s),
-        cut at the pauses Silero VAD finds; a longer unbroken run is cut at the limit."""
+    def _clip_pieces(self, pcm: np.ndarray) -> list[tuple]:
+        """A clip in pieces of at most CLIP_PIECE_SECONDS (Whisper's window is 30 s), as (first sample,
+        samples), cut at the pauses Silero VAD finds; a longer unbroken run is cut at the limit."""
         limit = int(CLIP_PIECE_SECONDS * self.sample_rate)
         if len(pcm) <= limit:
-            return [pcm]
+            return [(0, pcm)]
         if self.clip_vad_model is None:     # its own instance: the live path uses vad_model on the event loop
             self.clip_vad_model = silero_vad.load_silero_vad()
         spans = silero_vad.get_speech_timestamps(torch.from_numpy(pcm), self.clip_vad_model,
@@ -680,9 +762,13 @@ class STTServer:
             end = s["end"]
         pieces.append((start, end))
         pad = int(0.2 * self.sample_rate)
-        return [pcm[max(0, a - pad):min(len(pcm), b + pad)] for a, b in pieces if b > a]
+        return [(max(0, a - pad), pcm[max(0, a - pad):min(len(pcm), b + pad)]) for a, b in pieces if b > a]
 
-    def _decode_piece(self, features, language: Optional[str], temperature: float, prompt: Optional[str] = None) -> str:
+    def _decode_piece(self, features, language: Optional[str], temperature: float, prompt: Optional[str] = None,
+                      attention_mask=None):
+        """The piece's text; with attention_mask given, (text, words): each word [text, start, end] in
+        seconds from the piece's start, from Whisper's cross-attention alignment heads (the uncompiled
+        model: the timings need the attention weights, which the compiled graph does not return)."""
         kw = dict(max_new_tokens=440, num_beams=1, task="transcribe", language=language,
                   condition_on_prev_tokens=False)
         if prompt:
@@ -695,11 +781,40 @@ class STTServer:
             kw.update(do_sample=True, temperature=temperature)
         else:
             kw.update(do_sample=False)
+        if attention_mask is None:
+            with torch.inference_mode():
+                out = self.whisper_model.generate(features, **kw)  # type: ignore
+            return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()  # type: ignore
+        model = getattr(self.whisper_model, "_orig_mod", self.whisper_model)
         with torch.inference_mode():
-            out = self.whisper_model.generate(features, **kw)  # type: ignore
-        return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()  # type: ignore
+            out = model.generate(features, attention_mask=attention_mask, return_token_timestamps=True, **kw)  # type: ignore
+        seq, stamps = out["sequences"][0], out["token_timestamps"][0]
+        text = self.processor.batch_decode(seq.unsqueeze(0), skip_special_tokens=True)[0].strip()  # type: ignore
+        return text, self._words(seq, stamps)
 
-    def _transcribe_clip_sync(self, pcm: np.ndarray, language: Optional[str], prompt: Optional[str] = None) -> dict:
+    def _words(self, seq, stamps) -> list:
+        """Tokens grouped into words (a token starting with a space starts a word): [text, start, end],
+        a token's time being where it ends; a word starts where the token before it ended."""
+        tok = self.processor.tokenizer  # type: ignore
+        special = set(tok.all_special_ids)
+        words, cur, start, end = [], "", None, None
+        for i, tid in enumerate(seq.tolist()):
+            if tid in special or tid >= tok.eos_token_id:
+                continue
+            piece = tok.decode([tid])
+            if piece.startswith(" ") and cur.strip():
+                words.append([cur.strip(), round(start, 3), round(end, 3)])
+                cur, start = "", None
+            if start is None:
+                start = float(stamps[i - 1]) if i > 0 else float(stamps[i])
+            cur += piece
+            end = float(stamps[i])
+        if cur.strip():
+            words.append([cur.strip(), round(start, 3), round(end, 3)])
+        return words
+
+    def _transcribe_clip_sync(self, pcm: np.ndarray, language: Optional[str], prompt: Optional[str] = None,
+                              words: bool = False) -> dict:
         """Whisper on one clip with the language given. Each piece is decoded greedily and,
         as in Whisper's own decoding, again at rising temperatures while the text repeats
         itself (zlib compression ratio above CLIP_MAX_COMPRESSION) or holds more words than
@@ -709,27 +824,61 @@ class STTServer:
             rms = float(np.sqrt(np.mean(pcm ** 2)))
             if 20.0 * math.log10(rms + 1e-12) < MIN_AUDIO_RMS_DBFS:
                 return {"text": "", "rejected": "silence"}
-            texts = []
-            for piece in self._clip_pieces(pcm):
+            texts, segments = [], []
+            for offset, piece in self._clip_pieces(pcm):
                 seconds = len(piece) / self.sample_rate
-                inputs = self.processor(piece, sampling_rate=self.sample_rate, return_tensors="pt")  # type: ignore
+                inputs = self.processor(piece, sampling_rate=self.sample_rate, return_tensors="pt",  # type: ignore
+                                        return_attention_mask=words)
                 features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
+                mask = inputs["attention_mask"].to(self.device) if words else None
                 for temperature in CLIP_TEMPERATURES:
-                    text = self._decode_piece(features, language, temperature, prompt)
+                    text = self._decode_piece(features, language, temperature, prompt, attention_mask=mask)
+                    if words:
+                        text, piece_words = text
                     raw = text.encode("utf-8")
                     ratio = len(raw) / max(1, len(zlib.compress(raw)))
                     if ratio <= CLIP_MAX_COMPRESSION and len(text.split()) <= CLIP_MAX_WORDS_PER_SECOND * seconds + 2:
                         break
                 else:
                     print(f"🔁 CLIP_REJECT repetition dur={seconds:.1f}s text={text[:80]!r}", flush=True)
+                    if words:       # with words (a long recording in parts): only this piece is lost
+                        at = offset / self.sample_rate
+                        segments.append({"start": round(at, 3), "end": round(at + seconds, 3), "text": "",
+                                         "words": [], "rejected": "repetition"})
+                        continue
                     return {"text": "", "rejected": "repetition"}
                 texts.append(text)
-            return {"text": " ".join(t for t in texts if t), "rejected": None}
+                if words:
+                    at = offset / self.sample_rate
+                    segments.append({"start": round(at, 3), "end": round(at + seconds, 3), "text": text,
+                                     "words": [[w, round(a + at, 3), round(b + at, 3)] for w, a, b in piece_words]})
+            out = {"text": " ".join(t for t in texts if t), "rejected": None}
+            if words:
+                out["segments"] = segments
+            return out
         except Exception as e:
             self.logger.error(f"Clip transcription error: {e}")
             return {"text": "", "rejected": f"error: {e}"}
         finally:
             self._log_thread_usage("end", "(clip)")
+
+    def _transcribe_live_clip_sync(self, pcm: np.ndarray, language: Optional[str]) -> dict:
+        """A live segment of an opt-in sender: raised to a speaking level, then the clip decoder."""
+        duration_s = len(pcm) / self.sample_rate
+        rms_db = 20.0 * math.log10(float(np.sqrt(np.mean(pcm ** 2))) + 1e-12)
+        if rms_db < LIVE_MIN_RMS_DBFS:
+            print(f"🔇 LIVE_CLIP_SILENCE rms={rms_db:.1f}dBFS dur={duration_s:.2f}s", flush=True)
+            return {"text": "", "rejected": "silence"}
+        peak_db = 20.0 * math.log10(float(np.abs(pcm).max()) + 1e-12)
+        gain = max(0.0, min(LIVE_TARGET_DBFS - rms_db, LIVE_PEAK_DBFS - peak_db, LIVE_MAX_GAIN_DB))
+        if gain >= 1.0:
+            pcm = (pcm * 10 ** (gain / 20)).astype(np.float32)
+        result = self._transcribe_clip_sync(pcm, language, words=True)
+        text = result.get("text") or ""
+        if text and duration_s < SHORT_AUDIO_DURATION_S and _normalize_for_blocklist(text) in HALLUCINATION_BLOCKLIST:
+            print(f"🚫 BLOCKLIST_REJECT text={text!r} dur={duration_s:.2f}s", flush=True)
+            return {"text": "", "rejected": "blocklist"}
+        return result
 
     async def _transcribe_async(self, audio_segment: np.ndarray, client_id: str) -> str:
         """Async wrapper for transcription."""
@@ -744,6 +893,35 @@ class STTServer:
             self.audio_buffer = []
             self.last_processed_time = 0
             self.last_check_time = 0
+            # samples dropped from the front of the buffer so far: buffer position + dropped =
+            # position in the client's stream (the `start`/`end` sent with each transcription)
+            self.dropped = 0
+            self.last_span = (0.0, 0.0)          # stream seconds of the segment last returned
+            # set when the sender passes `language` in audio_data (null = detect): its segments
+            # go through the clip decoder (see _transcribe_live_clip_sync); unset = as before
+            self.clip = False
+            self.language: Optional[str] = None
+            self.pause = server_instance.silence_duration      # the silence that ends a segment
+            self.min_speech = server_instance.min_speech_duration  # the shortest speech that is a segment
+            self.inflight = 0                    # segments being transcribed (audio_end waits for them)
+            self.levels: deque = deque(maxlen=LIVE_LEVEL_WINDOW)  # opt-in: recent packet RMS levels (dBFS)
+            self.peaks: deque = deque(maxlen=LIVE_PEAK_WINDOW)    # the last packets' peaks (dBFS)
+
+        def raise_level(self, samples: np.ndarray) -> np.ndarray:
+            """Opt-in senders: quiet speech raised before the VAD sees it (LIVE_LEVEL_WINDOW)."""
+            if not len(samples):
+                return samples
+            self.levels.append(10.0 * math.log10(float(np.mean(samples.astype(np.float64) ** 2)) + 1e-12))
+            self.peaks.append(20.0 * math.log10(float(np.abs(samples).max()) + 1e-12))
+            gain_db = float(np.clip(min(LIVE_TARGET_DBFS - np.percentile(self.levels, 90),
+                                        LIVE_PEAK_DBFS - max(self.peaks)), 0.0, LIVE_MAX_GAIN_DB))
+            if gain_db < 1.0:
+                return samples
+            return (np.tanh(samples * 10 ** (gain_db / 20)) * 0.9).astype(np.float32)
+
+        def _span(self, start_sample: int, end_sample: int) -> tuple:
+            sr = self.server.sample_rate
+            return ((self.dropped + start_sample) / sr, (self.dropped + end_sample) / sr)
 
         def add_audio(self, samples):
             """Add audio samples to the per-client rolling buffer.
@@ -773,6 +951,7 @@ class STTServer:
                 n_processed = int(self.last_processed_time * self.server.sample_rate)
                 if 0 < n_processed <= len(self.audio_buffer):
                     self.audio_buffer = self.audio_buffer[n_processed:]
+                    self.dropped += n_processed
                     self.last_processed_time = 0.0
 
             # Phase 2: safety cap.
@@ -780,9 +959,20 @@ class STTServer:
             if len(self.audio_buffer) > max_samples:
                 excess = len(self.audio_buffer) - max_samples
                 self.audio_buffer = self.audio_buffer[excess:]
+                self.dropped += excess
                 # last_processed_time is already 0 from Phase 1; nothing
                 # else to adjust.
         
+        def done_before(self, start_time: float) -> bool:
+            """Whether a VAD segment starting at start_time (buffer seconds) was already emitted. After a
+            segment the buffer is cut at its end and restarts at 0, so speech that runs straight on starts
+            at 0.0: counted as done by `<=`, it was never emitted, the buffer filled to MAX_BUFFER_SECONDS
+            and dropped it from the front (a phone recording: 16 s lost at audio_end; measured 2026-09-30).
+            Opt-in senders get `<`; the others keep the previous behaviour."""
+            if self.clip:
+                return start_time < self.last_processed_time
+            return start_time <= self.last_processed_time
+
         def should_check_for_segments(self) -> bool:
             """Rate limit segment checking."""
             current_time = time.time()
@@ -809,8 +999,8 @@ class STTServer:
                         self.server.vad_model,
                         sampling_rate=self.server.sample_rate,
                         threshold=self.server.vad_threshold,
-                        min_speech_duration_ms=int(self.server.min_speech_duration * 1000),
-                        min_silence_duration_ms=int(self.server.silence_duration * 1000)
+                        min_speech_duration_ms=int(self.min_speech * 1000),
+                        min_silence_duration_ms=int(self.pause * 1000)
                     )
             except Exception:
                 return None
@@ -829,17 +1019,18 @@ class STTServer:
                 end_time = end_sample / self.server.sample_rate
                 
                 # Skip if already processed
-                if start_time <= self.last_processed_time:
+                if self.done_before(start_time):
                     continue
                 
                 # Check for enough silence
                 silence_after = buffer_duration - end_time
                 
-                if silence_after >= self.server.silence_duration:
+                if silence_after >= self.pause:
                     duration = (end_sample - start_sample) / self.server.sample_rate
-                    if duration >= self.server.min_speech_duration:
+                    if duration >= self.min_speech:
                         audio_data = np.array(self.audio_buffer[start_sample:end_sample])
                         self.last_processed_time = end_time
+                        self.last_span = self._span(start_sample, end_sample)
                         return audio_data
 
             # Force-flush safety net: the buffer is at/near the hard cap and no
@@ -856,12 +1047,16 @@ class STTServer:
                     end_sample = segment['end']
                     start_time = start_sample / self.server.sample_rate
                     end_time = end_sample / self.server.sample_rate
-                    if start_time <= self.last_processed_time:
+                    if self.done_before(start_time):
                         continue
                     duration = (end_sample - start_sample) / self.server.sample_rate
-                    if duration >= self.server.min_speech_duration:
+                    if duration >= self.min_speech:
+                        if self.clip:
+                            end_sample = self.quiet_cut(start_sample, end_sample)
+                            end_time = end_sample / self.server.sample_rate
                         audio_data = np.array(self.audio_buffer[start_sample:end_sample])
                         self.last_processed_time = end_time
+                        self.last_span = self._span(start_sample, end_sample)
                         print(
                             f"[DIAG] FORCE-FLUSH at {buffer_duration:.1f}s cap: "
                             f"emitting {duration:.1f}s segment (no trailing silence)",
@@ -870,6 +1065,42 @@ class STTServer:
                         return audio_data
 
             return None
+
+        def quiet_cut(self, start_sample: int, end_sample: int) -> int:
+            """Opt-in senders: where to end a segment forced out by the buffer cap (nobody paused): the
+            middle of the quietest LIVE_CUT_QUIET_SEC within the last LIVE_CUT_SEARCH_SEC, not wherever the
+            cap fell. Cut mid-word, Whisper lost the words around the cut and often the start of the next
+            segment (a second reader's 5 s, measured 2026-09-30)."""
+            sr = self.server.sample_rate
+            win, lo = int(LIVE_CUT_QUIET_SEC * sr), max(start_sample + sr, end_sample - int(LIVE_CUT_SEARCH_SEC * sr))
+            if end_sample - lo <= win:
+                return end_sample
+            x = np.asarray(self.audio_buffer[lo:end_sample], dtype=np.float64) ** 2
+            csum = np.concatenate([[0.0], np.cumsum(x)])
+            energy = csum[win:] - csum[:-win]
+            return lo + int(np.argmin(energy)) + win // 2
+
+        def remaining_segments(self) -> list:
+            """Every unprocessed speech segment left in the buffer, with its stream span, whatever
+            the silence after it (the sender has ended its audio: `audio_end`). Empties the buffer."""
+            buf = self.audio_buffer
+            self.audio_buffer, out = [], []
+            if len(buf) < self.server.sample_rate * self.min_speech:
+                self.dropped += len(buf)
+                return out
+            with torch.no_grad():
+                segments = silero_vad.get_speech_timestamps(
+                    torch.FloatTensor(buf), self.server.vad_model, sampling_rate=self.server.sample_rate,
+                    threshold=self.server.vad_threshold,
+                    min_speech_duration_ms=int(self.min_speech * 1000),
+                    min_silence_duration_ms=int(self.pause * 1000))
+            for seg in segments:
+                if self.done_before(seg["start"] / self.server.sample_rate):
+                    continue
+                out.append((np.array(buf[seg["start"]:seg["end"]]), self._span(seg["start"], seg["end"])))
+            self.dropped += len(buf)
+            self.last_processed_time = 0.0
+            return out
     
     async def start(self):
         """Start the server."""
