@@ -968,10 +968,9 @@ class STTServer:
             segment the buffer is cut at its end and restarts at 0, so speech that runs straight on starts
             at 0.0: counted as done by `<=`, it was never emitted, the buffer filled to MAX_BUFFER_SECONDS
             and dropped it from the front (a phone recording: 16 s lost at audio_end; measured 2026-09-30).
-            Opt-in senders get `<`; the others keep the previous behaviour."""
-            if self.clip:
-                return start_time < self.last_processed_time
-            return start_time <= self.last_processed_time
+            `<` for every sender since 2026-10-02 (before, only opt-in senders): a segment that was emitted
+            always starts before the mark, so `<` never emits one twice."""
+            return start_time < self.last_processed_time
 
         def should_check_for_segments(self) -> bool:
             """Rate limit segment checking."""
