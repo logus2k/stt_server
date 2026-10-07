@@ -7,6 +7,7 @@ pip install transformers accelerate python-socketio uvicorn silero-vad
 
 import asyncio
 import math
+import threading
 import socketio
 import uvicorn
 import torch
@@ -252,6 +253,12 @@ class STTServer:
         self.vad_model = None
         self.clip_vad_model = None
         self.thread_pool = None
+        # One decode on the GPU at a time. The worker threads share one compiled Whisper (torch.compile
+        # "reduce-overhead": CUDA graphs), which is not safe to run from two threads at once: overlapping
+        # requests hung every worker on the GPU for good (measured 2026-10-06: four clients at once hung it
+        # within seconds, the same sixteen requests one after another never did). Held per live segment and
+        # per piece of a clip (seconds), so a live stream waits at most for one piece of someone's recording.
+        self.gpu_lock = threading.Lock()
         self.server = None
         self.active_transcriptions = 0
         
@@ -643,9 +650,9 @@ class STTServer:
                 return ""
 
             inputs = self.processor(audio_segment, sampling_rate=self.sample_rate, return_tensors="pt") # type: ignore
-            input_features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
 
-            with torch.inference_mode():
+            with self.gpu_lock, torch.inference_mode():   # one decode on the GPU at a time (gpu_lock)
+                input_features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
                 # Note: dropped return_timestamps=True and the
                 # *_threshold filters. Those filters only function in
                 # HF Whisper's long-form generation path (audio > 30s),
@@ -829,10 +836,11 @@ class STTServer:
                 seconds = len(piece) / self.sample_rate
                 inputs = self.processor(piece, sampling_rate=self.sample_rate, return_tensors="pt",  # type: ignore
                                         return_attention_mask=words)
-                features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
-                mask = inputs["attention_mask"].to(self.device) if words else None
                 for temperature in CLIP_TEMPERATURES:
-                    text = self._decode_piece(features, language, temperature, prompt, attention_mask=mask)
+                    with self.gpu_lock:          # one decode on the GPU at a time (gpu_lock)
+                        features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
+                        mask = inputs["attention_mask"].to(self.device) if words else None
+                        text = self._decode_piece(features, language, temperature, prompt, attention_mask=mask)
                     if words:
                         text, piece_words = text
                     raw = text.encode("utf-8")
