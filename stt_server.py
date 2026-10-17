@@ -6,7 +6,10 @@ pip install transformers accelerate python-socketio uvicorn silero-vad
 """
 
 import asyncio
+import gc
+import hmac
 import math
+import os
 import threading
 import socketio
 import uvicorn
@@ -259,6 +262,13 @@ class STTServer:
         # within seconds, the same sixteen requests one after another never did). Held per live segment and
         # per piece of a clip (seconds), so a live stream waits at most for one piece of someone's recording.
         self.gpu_lock = threading.Lock()
+        # The GPU on request (README "Releasing the GPU"): another application (Cortex, ingesting documents) may ask
+        # for the card's memory back. Released, Whisper waits in host memory (measured 2026-10-16: frees ~1.8 GB of
+        # the card, back in 0.25 s, the same text); a request that arrives meanwhile brings it back first and is
+        # served - slower by that, never refused. A release is a lease: when it lapses the model comes back by itself,
+        # so a caller that died cannot leave it away.
+        self.model_state = "loaded"            # loaded | released
+        self.lease = {"until": None, "reason": "", "by": ""}
         self.server = None
         self.active_transcriptions = 0
         
@@ -272,7 +282,7 @@ class STTServer:
             # default 1 MB dropped the connection on turns over ~31 s (measured)
             max_http_buffer_size=32 * 1024 * 1024
         )
-        self.app = socketio.ASGIApp(self.sio, other_asgi_app=None)
+        self.app = socketio.ASGIApp(self.sio, other_asgi_app=self._admin_app)   # /admin/*: the GPU on request
         
         # Client transcriber storage, keyed by the clientId a sender chose (or client-<sid>)
         self.client_transcribers = {}
@@ -598,6 +608,111 @@ class STTServer:
         
         print("✅ Models loaded successfully")
     
+    # ── the GPU on request ────────────────────────────────────────────────────────────────────────────────
+    def _to_gpu(self) -> float:
+        """Called with gpu_lock held: the released model back on the GPU; the seconds it took."""
+        t = time.time()
+        self.whisper_model.to(self.device)
+        self.model_state = "loaded"
+        return time.time() - t
+
+    def _on_gpu(self) -> None:
+        """Called with gpu_lock held, before a decode: a released model comes back first."""
+        if self.model_state == "released":
+            dt = self._to_gpu()
+            print(f"🎛️ GPU: model back on the GPU for a request ({dt:.2f} s); "
+                  f"lease of {self.lease['by'] or '?'} still open until it is renewed or lapses", flush=True)
+
+    def release_gpu(self, reason: str, minutes: float, by: str) -> dict:
+        """Whisper to host memory once the decode in flight ends (the lock); the lease renewed when already away."""
+        minutes = max(1.0, min(120.0, float(minutes or 10)))
+        if not self.gpu_lock.acquire(timeout=60):
+            return {"ok": False, "error": "a decode held the GPU for over 60 s", **self.state()}
+        try:
+            before = torch.cuda.memory_reserved() if self.device == "cuda" else 0
+            if self.model_state == "loaded" and self.device == "cuda":
+                self.whisper_model.to("cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
+                self.model_state = "released"
+            self.lease = {"until": time.time() + minutes * 60, "reason": str(reason)[:100], "by": str(by)[:60]}
+            freed = (before - torch.cuda.memory_reserved()) // 2**20 if self.device == "cuda" else 0
+        finally:
+            self.gpu_lock.release()
+        print(f"🎛️ GPU released for {self.lease['by'] or '?'} ({self.lease['reason'] or 'no reason'}), "
+              f"{minutes:g} min, freed {freed} MiB", flush=True)
+        return {"ok": True, "freed_mib": freed, **self.state()}
+
+    def load_gpu(self, why: str = "asked") -> dict:
+        with self.gpu_lock:
+            was = self.model_state
+            dt = self._to_gpu() if was == "released" else 0.0
+            self.lease = {"until": None, "reason": "", "by": ""}
+        if was == "released":
+            print(f"🎛️ GPU: model back ({why}; {dt:.2f} s)", flush=True)
+        return {"ok": True, **self.state()}
+
+    def state(self) -> dict:
+        until = self.lease["until"]
+        return {"state": self.model_state, "device": self.device,
+                "lease": {**self.lease, "until": until, "seconds_left": max(0, round(until - time.time())) if until else None},
+                "gpu_mib": torch.cuda.memory_reserved() // 2**20 if self.device == "cuda" else 0}
+
+    async def _lease_watch(self) -> None:
+        """A lapsed lease brings the model back (a caller that died never leaves it away)."""
+        while True:
+            await asyncio.sleep(10)
+            until = self.lease["until"]
+            if until and time.time() > until:
+                await asyncio.get_event_loop().run_in_executor(None, self.load_gpu, "the lease lapsed")
+
+    async def _admin_app(self, scope, receive, send) -> None:
+        """POST /admin/release {reason, minutes, by} · POST /admin/load · GET /admin/state. Only with the header
+        X-Admin-Secret = SPEECH_ADMIN_SECRET (the service's .env); unset, there are no admin routes."""
+        if scope["type"] == "lifespan":               # socket.io hands the lifespan to this app
+            while True:
+                msg = await receive()
+                if msg["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif msg["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        if scope["type"] != "http":
+            return
+
+        async def answer(status: int, body: dict) -> None:
+            data = json.dumps(body).encode()
+            await send({"type": "http.response.start", "status": status,
+                        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(data)).encode())]})
+            await send({"type": "http.response.body", "body": data})
+
+        secret = os.environ.get("SPEECH_ADMIN_SECRET", "")
+        path, method = scope.get("path", ""), scope.get("method", "")
+        if not secret or not path.startswith("/admin/"):
+            return await answer(404, {"detail": "not found"})
+        given = dict(scope.get("headers") or []).get(b"x-admin-secret", b"").decode("latin-1")
+        if not hmac.compare_digest(given, secret):
+            return await answer(403, {"detail": "wrong or missing X-Admin-Secret"})
+        raw = b""
+        while True:
+            msg = await receive()
+            raw += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        try:
+            body = json.loads(raw) if raw else {}
+        except ValueError:
+            return await answer(400, {"detail": "the body is not JSON"})
+        loop = asyncio.get_event_loop()
+        if path == "/admin/state" and method == "GET":
+            return await answer(200, self.state())
+        if path == "/admin/release" and method == "POST":
+            return await answer(200, await loop.run_in_executor(
+                None, self.release_gpu, body.get("reason", ""), body.get("minutes", 10), body.get("by", "")))
+        if path == "/admin/load" and method == "POST":
+            return await answer(200, await loop.run_in_executor(None, self.load_gpu, "asked"))
+        return await answer(404, {"detail": "not found"})
+
     def _log_thread_usage(self, action: str, client_info: str = ""):
         """Log thread pool usage changes."""
         if action == "start":
@@ -652,6 +767,7 @@ class STTServer:
             inputs = self.processor(audio_segment, sampling_rate=self.sample_rate, return_tensors="pt") # type: ignore
 
             with self.gpu_lock, torch.inference_mode():   # one decode on the GPU at a time (gpu_lock)
+                self._on_gpu()
                 input_features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
                 # Note: dropped return_timestamps=True and the
                 # *_threshold filters. Those filters only function in
@@ -838,6 +954,7 @@ class STTServer:
                                         return_attention_mask=words)
                 for temperature in CLIP_TEMPERATURES:
                     with self.gpu_lock:          # one decode on the GPU at a time (gpu_lock)
+                        self._on_gpu()
                         features = inputs["input_features"].to(self.device, dtype=self.torch_dtype)
                         mask = inputs["attention_mask"].to(self.device) if words else None
                         text = self._decode_piece(features, language, temperature, prompt, attention_mask=mask)
@@ -1115,6 +1232,7 @@ class STTServer:
             await self.initialize()
         
         print(f"🟢 Server listening on {self.host}:{self.port}")
+        asyncio.create_task(self._lease_watch())
         
         # Create and configure uvicorn server
         config = uvicorn.Config(

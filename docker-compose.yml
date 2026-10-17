@@ -7,6 +7,9 @@ services:
     image: stt_server:1.0
     container_name: stt_server
     hostname: stt_server
+    environment:
+      # the admin routes (README "Releasing the GPU"); unset = none. Kept in ./.env (git-ignored)
+      - SPEECH_ADMIN_SECRET=${SPEECH_ADMIN_SECRET:-}
     deploy:
       resources:
         reservations:
