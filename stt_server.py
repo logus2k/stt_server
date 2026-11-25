@@ -10,6 +10,7 @@ import gc
 import hmac
 import math
 import os
+import sys
 import threading
 import socketio
 import uvicorn
@@ -269,6 +270,15 @@ class STTServer:
         # so a caller that died cannot leave it away.
         self.model_state = "loaded"            # loaded | released
         self.lease = {"until": None, "reason": "", "by": ""}
+        # Started by a lease's release (the process re-executed itself, _reexec): Whisper loads in host memory and the
+        # GPU is not touched - a live CUDA context alone holds ~440 MiB of the card (measured 2026-11-17, Cortex
+        # register #468), which moving the model to the host could not give back. A request, /admin/load or the
+        # lapse brings it to the GPU (_to_gpu).
+        until = float(os.environ.pop("STT_LEASE_UNTIL", "0") or 0)
+        self.start_released = until > time.time() and self.device == "cuda"
+        if self.start_released:
+            self.model_state = "released"
+            self.lease = {"until": until, "reason": os.environ.pop("STT_LEASE_REASON", ""), "by": os.environ.pop("STT_LEASE_BY", "")}
         self.server = None
         self.active_transcriptions = 0
         
@@ -582,8 +592,11 @@ class STTServer:
             language = data.get("language") or None
             prompt = (data.get("prompt") or "").strip() or None
             words = bool(data.get("words"))       # each piece's words with their times (segments)
+            # no language given, a list of them: detected among those only ("languages": ["en", "pt"]) - over all of
+            # Whisper's, a room's noise came back as Japanese (Cortex register #652, 2026-11-25)
+            allowed = [str(c) for c in (data.get("languages") or []) if isinstance(c, str) and c] if language is None else []
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language, prompt, words)
+            return await loop.run_in_executor(self.thread_pool, self._transcribe_clip_sync, pcm, language, prompt, words, allowed)
 
 
     async def initialize(self):
@@ -595,7 +608,7 @@ class STTServer:
             self.model_path,
             torch_dtype=self.torch_dtype,
             low_cpu_mem_usage=True
-        ).to(self.device)
+        ).to("cpu" if self.start_released else self.device)
         self.whisper_model = torch.compile(self.whisper_model, mode="reduce-overhead", fullgraph=True)
         
         self.processor = AutoProcessor.from_pretrained(self.model_path)
@@ -623,13 +636,36 @@ class STTServer:
             print(f"🎛️ GPU: model back on the GPU for a request ({dt:.2f} s); "
                   f"lease of {self.lease['by'] or '?'} still open until it is renewed or lapses", flush=True)
 
+    def _reexec(self) -> None:
+        """The process started again in its place (same pid, same command), the lease in its environment: it comes up
+        with Whisper in host memory and no context on the card. Holds gpu_lock from the release on, so no decode starts
+        meanwhile; waits a moment for the release's answer to reach the caller."""
+        self.gpu_lock.acquire()
+        time.sleep(0.5)
+        print("🎛️ GPU lease: the process starts again without the GPU", flush=True)
+        os.execv(sys.executable, list(getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv]))
+
     def release_gpu(self, reason: str, minutes: float, by: str) -> dict:
-        """Whisper to host memory once the decode in flight ends (the lock); the lease renewed when already away."""
+        """Whisper off the card once the decode in flight ends (the lock); the lease renewed when already away. With a
+        context open on the card and no live session connected, the process starts again without one (_reexec): moving
+        Whisper to host memory gave back its memory but not the context's ~440 MiB (Cortex register #468). A live
+        session (audio streaming) keeps the process: Whisper goes to host memory, as before."""
         minutes = max(1.0, min(120.0, float(minutes or 10)))
         if not self.gpu_lock.acquire(timeout=60):
             return {"ok": False, "error": "a decode held the GPU for over 60 s", **self.state()}
+        restart = False
         try:
             before = torch.cuda.memory_reserved() if self.device == "cuda" else 0
+            if self.device == "cuda" and torch.cuda.is_initialized() and not self.client_transcribers:
+                restart = True
+                self.lease = {"until": time.time() + minutes * 60, "reason": str(reason)[:100], "by": str(by)[:60]}
+                os.environ.update(STT_LEASE_UNTIL=str(self.lease["until"]), STT_LEASE_REASON=self.lease["reason"],
+                                  STT_LEASE_BY=self.lease["by"])
+                self.model_state = "released"
+                threading.Thread(target=self._reexec, daemon=True).start()
+                print(f"🎛️ GPU released for {self.lease['by'] or '?'} ({self.lease['reason'] or 'no reason'}), "
+                      f"{minutes:g} min: {before // 2**20} MiB and the context given back, the process starts again", flush=True)
+                return {"ok": True, "freed_mib": before // 2**20, "restarting": True, **self.state()}
             if self.model_state == "loaded" and self.device == "cuda":
                 self.whisper_model.to("cpu")
                 gc.collect()
@@ -936,8 +972,22 @@ class STTServer:
             words.append([cur.strip(), round(start, 3), round(end, 3)])
         return words
 
+    def _detect_among(self, features, allowed: list) -> Optional[str]:
+        """The language of a piece among `allowed` only (Whisper codes): the decoder's first step after its start token
+        scores every language token; the best of the allowed ones. None when none of them is a Whisper language."""
+        tok = self.processor.tokenizer  # type: ignore
+        ids = {c: tok.convert_tokens_to_ids(f"<|{c}|>") for c in allowed}
+        ids = {c: i for c, i in ids.items() if isinstance(i, int) and i != tok.unk_token_id}
+        if not ids:
+            return None
+        model = getattr(self.whisper_model, "_orig_mod", self.whisper_model)   # one step: the uncompiled module
+        start = torch.tensor([[model.generation_config.decoder_start_token_id]], device=features.device)
+        with torch.inference_mode():
+            logits = model(input_features=features, decoder_input_ids=start).logits[0, -1]
+        return max(ids, key=lambda c: float(logits[ids[c]]))
+
     def _transcribe_clip_sync(self, pcm: np.ndarray, language: Optional[str], prompt: Optional[str] = None,
-                              words: bool = False) -> dict:
+                              words: bool = False, allowed: Optional[list] = None) -> dict:
         """Whisper on one clip with the language given. Each piece is decoded greedily and,
         as in Whisper's own decoding, again at rising temperatures while the text repeats
         itself (zlib compression ratio above CLIP_MAX_COMPRESSION) or holds more words than
@@ -952,6 +1002,11 @@ class STTServer:
                 seconds = len(piece) / self.sample_rate
                 inputs = self.processor(piece, sampling_rate=self.sample_rate, return_tensors="pt",  # type: ignore
                                         return_attention_mask=words)
+                if language is None and allowed:          # once, on the clip's first piece; the rest in that language
+                    with self.gpu_lock:
+                        self._on_gpu()
+                        language = self._detect_among(inputs["input_features"].to(self.device, dtype=self.torch_dtype), allowed)
+                    print(f"🌐 CLIP_LANGUAGE {language} among {allowed}", flush=True)
                 for temperature in CLIP_TEMPERATURES:
                     with self.gpu_lock:          # one decode on the GPU at a time (gpu_lock)
                         self._on_gpu()
@@ -978,6 +1033,8 @@ class STTServer:
                     segments.append({"start": round(at, 3), "end": round(at + seconds, 3), "text": text,
                                      "words": [[w, round(a + at, 3), round(b + at, 3)] for w, a, b in piece_words]})
             out = {"text": " ".join(t for t in texts if t), "rejected": None}
+            if allowed:
+                out["language"] = language                # the one detected among those asked
             if words:
                 out["segments"] = segments
             return out

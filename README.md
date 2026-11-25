@@ -165,9 +165,11 @@ service keeps running: a transcription that arrives meanwhile brings the model b
 never refused. A release is a **lease**: it lapses after `minutes` (1-120, default 10) and the model comes back by
 itself, so a caller that died cannot leave it away; releasing again renews it.
 
+Since 2026-11-17 (Cortex register #468) a release with the model on the card **starts the process again** in its place (same pid, same command; `os.execv`), the lease in its environment: it comes up with the model in host memory and **no CUDA context** - a live context alone holds ~440 MiB of the card, which moving the model to the host never gave back - unless a live session is connected (audio streaming): then the process stays and Whisper waits in host memory, as before. The answer says `restarting: true`; the service is unreachable for the seconds the start takes, and a connected socket is dropped (its client reconnects). The next request, `/admin/load` or the lapse brings the model to the GPU.
+
 | Route | What |
 | --- | --- |
-| `POST /admin/release` `{"reason", "minutes", "by"}` | waits for the work in flight, moves the model to host memory, answers `{state, freed_mib, lease, gpu_mib}` |
+| `POST /admin/release` `{"reason", "minutes", "by"}` | waits for the work in flight, gives the model's memory and the context back (the process starts again; see above), answers `{state, freed_mib, restarting, lease, gpu_mib}` |
 | `POST /admin/load` | the model back now; the lease closed |
 | `GET /admin/state` | `{state: loaded\|released, lease: {until, reason, by, seconds_left}, gpu_mib}` |
 
